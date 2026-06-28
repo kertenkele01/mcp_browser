@@ -1,13 +1,24 @@
 {
   "name": "mcp-android-bridge",
   "version": "1.0.0",
-  "description": "Android Browser MCP Bridge Server",
-  "main": "index.js",
+  "description": "Android Browser Model Context Protocol (MCP) Bridge Server",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.17.0"
-  }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "android",
+    "bridge",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "ISC"
 }
