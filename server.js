@@ -6,122 +6,309 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 app.use(express.json());
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
 const PORT = process.env.PORT || 3000;
-const ACCESS_TOKEN = process.env.ACCESS_TOKEN || "secure_mcp_token"; // Güvenlik Anahtarı
+const ACCESS_TOKEN = process.env.ACCESS_TOKEN || "secure_mcp_token";
 
-// Aktif Android Tarayıcı bağlantılarını tutar
-const devices = new Map(); // deviceId -> { ws, token }
-// Askıda bekleyen AI isteklerini tutar (callback'ler)
-const pendingRequests = new Map(); // messageId -> { resolve, reject, timeout }
+// Cihaz ve bekleyen isteklerin state takibi
+const connectedBrowsers = new Map(); // deviceId -> ws connection
+const pendingRequests = new Map();   // messageId -> { resolve, reject, timeout }
 
-// HTTP Sunucu Durum Sayfası
-app.get('/', (req, res) => {
-    res.json({
-        status: "online",
-        message: "Android AI Browser MCP Bridge is running!",
-        connected_devices: Array.from(devices.keys())
-    });
+// HTTP Sunucusu oluşturma
+const server = http.createServer(app);
+
+// 1. Android WebSocket Sunucusu kurulumu
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
+  });
 });
 
-// WebSocket Bağlantı Noktası (Android Cihazlar İçin)
 wss.on('connection', (ws) => {
-    console.log('Yeni bir ham WebSocket bağlantısı kuruldu.');
-    let registeredDeviceId = null;
+  let registeredDeviceId = null;
 
-    ws.on('message', (messageStr) => {
-        try {
-            const message = JSON.parse(messageStr);
-            
-            // 1. Android Cihaz Kaydı
-            if (message.type === 'register' && message.role === 'browser') {
-                if (message.token !== ACCESS_TOKEN) {
-                    console.log(`Hatalı Token Denemesi: ${message.deviceId}`);
-                    ws.send(JSON.stringify({ type: "error", message: "Yetkisiz erişim: Hatalı Token" }));
-                    ws.close();
-                    return;
-                }
-
-                registeredDeviceId = message.deviceId;
-                devices.set(registeredDeviceId, { ws, token: message.token });
-                console.log(`Android cihazı başarıyla eşlendi: ${registeredDeviceId}`);
-                ws.send(JSON.stringify({ type: "register_ack", status: "success" }));
-                return;
-            }
-
-            // 2. Android Cihazından Gelen Komut Yanıtları
-            if (message.type === 'response') {
-                const messageId = message.messageId;
-                if (pendingRequests.has(messageId)) {
-                    const { resolve, timeout } = pendingRequests.get(messageId);
-                    clearTimeout(timeout);
-                    pendingRequests.delete(messageId);
-                    resolve(message);
-                }
-                return;
-            }
-
-        } catch (err) {
-            console.error('Mesaj işlenirken hata oluştu:', err);
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      
+      // Android cihaz kaydı
+      if (data.type === 'register' && data.role === 'browser') {
+        if (data.token !== ACCESS_TOKEN) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Yetkisiz erişim anahtarı!' }));
+          ws.close();
+          return;
         }
-    });
+        registeredDeviceId = data.deviceId;
+        connectedBrowsers.set(registeredDeviceId, ws);
+        console.log(`📱 Android tarayıcı bağlandı: ${registeredDeviceId}`);
+        ws.send(JSON.stringify({ type: 'register_ack', status: 'connected' }));
+      }
 
-    ws.on('close', () => {
-        if (registeredDeviceId) {
-            devices.delete(registeredDeviceId);
-            console.log(`Cihaz bağlantısı koptu: ${registeredDeviceId}`);
+      // Android cihazdan dönen yanıtları yakala ve bekleyen MCP isteğine ilet
+      if (data.type === 'response') {
+        const messageId = data.messageId;
+        if (pendingRequests.has(messageId)) {
+          const { resolve, timeout } = pendingRequests.get(messageId);
+          clearTimeout(timeout);
+          pendingRequests.delete(messageId);
+          resolve(data);
         }
-    });
+      }
+    } catch (e) {
+      console.error('WebSocket veri işleme hatası:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    if (registeredDeviceId) {
+      connectedBrowsers.delete(registeredDeviceId);
+      console.log(`❌ Android cihaz bağlantısı koptu: ${registeredDeviceId}`);
+    }
+  });
 });
 
-// AI İÇİN MCP HTTP REST API (Komut Gönderme Arabirimi)
-// AI buraya POST isteği atarak telefona komut gönderir ve telefonun cevabını bekler.
-app.post('/api/mcp/command', (req, res) => {
-    const { deviceId, token, command, ...params } = req.body;
+// Render'ın uykuya dalmasını önlemek ve durum kontrolü için Ana Sayfa
+app.get('/', (req, res) => {
+  res.json({
+    status: "online",
+    message: "Android AI Browser MCP Bridge is running!",
+    connected_devices: Array.from(connectedBrowsers.keys())
+  });
+});
 
-    // Güvenlik Kontrolleri
-    if (token !== ACCESS_TOKEN) {
-        return res.status(401).json({ status: "error", error: "Yetkisiz erişim: Geçersiz Token" });
-    }
+// ==========================================
+// 2. MCP SERVER-SENT EVENTS (SSE) ENTEGRASYONU
+// ==========================================
 
-    const device = devices.get(deviceId);
-    if (!device) {
-        return res.status(404).json({ status: "error", error: `Eşleşen cihaz bulunamadı. Aktif cihazlar: ${Array.from(devices.keys()).join(', ')}` });
+const activeSseConnections = new Map(); // sessionId -> res
+
+// MCP SSE Bağlantı Noktası (Yapay zekanın bağlandığı yer)
+app.get('/sse', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  
+  const sessionId = uuidv4();
+  activeSseConnections.set(sessionId, res);
+
+  console.log(`🔌 AI Client (MCP SSE) bağlandı. Session ID: ${sessionId}`);
+
+  // MCP Standardına göre istemciye mesaj gönderebileceği HTTP endpoint'ini bildirin
+  const endpointUrl = `/message?sessionId=${sessionId}`;
+  res.write(`event: endpoint\ndata: ${encodeURIComponent(endpointUrl)}\n\n`);
+
+  req.on('close', () => {
+    activeSseConnections.delete(sessionId);
+    console.log(`❌ AI Client (MCP SSE) bağlantısı kesildi. Session ID: ${sessionId}`);
+  });
+});
+
+// AI İstemcisinden gelen JSON-RPC komutlarını alan HTTP POST endpoint'i
+app.post('/message', async (req, res) => {
+  const { sessionId } = req.query;
+  const rpcRequest = req.body;
+
+  if (!sessionId || !activeSseConnections.has(sessionId)) {
+    return res.status(400).json({ error: "Geçersiz veya süresi dolmuş oturum." });
+  }
+
+  console.log(`📥 AI komutu alındı:`, JSON.stringify(rpcRequest));
+
+  // 1. JSON-RPC Başlatma Talebi (initialize)
+  if (rpcRequest.method === 'initialize') {
+    const initResponse = {
+      jsonrpc: "2.0",
+      id: rpcRequest.id,
+      result: {
+        protocolVersion: "2024-11-05",
+        capabilities: {
+          tools: {}
+        },
+        serverInfo: {
+          name: "android-browser-bridge",
+          version: "1.0.0"
+        }
+      }
+    };
+    sendSseMessage(sessionId, initResponse);
+    return res.status(200).send('OK');
+  }
+
+  // 2. Araç Listesi Sunma (tools/list)
+  if (rpcRequest.method === 'tools/list') {
+    const listResponse = {
+      jsonrpc: "2.0",
+      id: rpcRequest.id,
+      result: {
+        tools: [
+          {
+            name: "android_navigate",
+            description: "Android telefondaki tarayıcıda belirtilen web sitesine gider.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                url: { type: "string", description: "Gidilecek web adresi (örn: https://google.com)" }
+              },
+              required: ["url"]
+            }
+          },
+          {
+            name: "android_get_html",
+            description: "Şu an açık olan sayfanın tam HTML kaynak kodunu ve URL'sini okur.",
+            inputSchema: { type: "object", properties: {} }
+          },
+          {
+            name: "android_scroll",
+            description: "Açık olan web sayfasını yukarı veya aşağı kaydırır.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                direction: { type: "string", enum: ["up", "down"], description: "Kaydırma yönü" }
+              },
+              required: ["direction"]
+            }
+          },
+          {
+            name: "android_click",
+            description: "Sayfa içindeki bir butona veya elemente CSS selector kullanarak tıklar.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                selector: { type: "string", description: "Tıklanacak elementin CSS selector'ü (örn: '#submit-btn' veya '.login-link')" }
+              },
+              required: ["selector"]
+            }
+          },
+          {
+            name: "android_execute_js",
+            description: "Sayfada özel bir JavaScript kodu çalıştırır ve sonucunu döner.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                script: { type: "string", description: "Çalıştırılacak JS kod satırı" }
+              },
+              required: ["script"]
+            }
+          }
+        ]
+      }
+    };
+    sendSseMessage(sessionId, listResponse);
+    return res.status(200).send('OK');
+  }
+
+  // 3. Araç Çalıştırma Talebi (tools/call)
+  if (rpcRequest.method === 'tools/call') {
+    const { name, arguments: args } = rpcRequest.params;
+    
+    // Aktif bir Android cihaz var mı kontrol et
+    const activeDevices = Array.from(connectedBrowsers.keys());
+    if (activeDevices.length === 0) {
+      sendSseError(sessionId, rpcRequest.id, "Bağlı aktif bir Android cihaz bulunamadı! Lütfen telefondan uygulamayı açıp bağlanın.");
+      return res.status(200).send('OK');
     }
+    
+    // İlk aktif cihaza yönlendir (İsteğe bağlı olarak parametreyle seçilebilir)
+    const targetDeviceId = activeDevices[0];
+    const ws = connectedBrowsers.get(targetDeviceId);
 
     const messageId = uuidv4();
-    const payload = {
-        type: command, // navigate, get_html, scroll, click, execute_js
-        messageId,
-        ...params
+    let commandType = "";
+
+    switch (name) {
+      case "android_navigate":
+        commandType = "navigate";
+        break;
+      case "android_get_html":
+        commandType = "get_html";
+        break;
+      case "android_scroll":
+        commandType = "scroll";
+        break;
+      case "android_click":
+        commandType = "click";
+        break;
+      case "android_execute_js":
+        commandType = "execute_js";
+        break;
+      default:
+        sendSseError(sessionId, rpcRequest.id, `Bilinmeyen araç: ${name}`);
+        return res.status(200).send('OK');
+    }
+
+    // Telefona gönderilecek paket
+    const androidPayload = {
+      type: commandType,
+      messageId: messageId,
+      ...args
     };
 
-    // Promise yapısı ile telefondan gelecek WebSocket cevabını bekliyoruz (Senkron köprüleme)
-    const responsePromise = new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-            pendingRequests.delete(messageId);
-            reject(new Error("Cihazdan yanıt gelmedi, zaman aşımı (Timeout)"));
-        }, 15000); // 15 Saniye limit
+    // Android cihazdan yanıt gelene kadar bekleyeceğimiz Promise'i kuruyoruz (10 Saniye Zaman Aşımı)
+    const pendingPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pendingRequests.delete(messageId);
+        reject(new Error("Android cihazdan zaman aşımı nedeniyle yanıt alınamadı (10sn)"));
+      }, 10000);
 
-        pendingRequests.set(messageId, { resolve, reject, timeout });
+      pendingRequests.set(messageId, { resolve, reject, timeout });
     });
 
-    // Komutu WebSocket üzerinden Android telefona gönder
-    device.ws.send(JSON.stringify(payload));
-    console.log(`Cihaza (${deviceId}) komut gönderildi: [${command}] - ID: ${messageId}`);
+    try {
+      // WebSocket üzerinden telefona komutu gönder
+      ws.send(JSON.stringify(androidPayload));
+      console.log(`📤 Komut telefona gönderildi (${targetDeviceId}):`, androidPayload);
 
-    // Telefondan gelen cevabı bekleyip HTTP yanıtı olarak AI istemcisine dön
-    responsePromise
-        .then(result => {
-            res.json(result);
-        })
-        .catch(err => {
-            res.status(504).json({ status: "error", error: err.message });
-        });
+      // Telefonun yanıt vermesini bekle
+      const androidResponse = await pendingPromise;
+
+      // MCP formatında AI istemcisine yanıt dön
+      const mcpResponse = {
+        jsonrpc: "2.0",
+        id: rpcRequest.id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: androidResponse.status === "success" 
+                ? JSON.stringify(androidResponse.data, null, 2)
+                : `Hata: ${androidResponse.error}`
+            }
+          ]
+        }
+      };
+
+      sendSseMessage(sessionId, mcpResponse);
+    } catch (err) {
+      sendSseError(sessionId, rpcRequest.id, err.message);
+    }
+
+    return res.status(200).send('OK');
+  }
+
+  // Diğer standart MCP metodları için boş onay dön
+  res.status(200).send('OK');
 });
 
+function sendSseMessage(sessionId, payload) {
+  const res = activeSseConnections.get(sessionId);
+  if (res) {
+    res.write(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
+  }
+}
+
+function sendSseError(sessionId, rpcId, message) {
+  const errorResponse = {
+    jsonrpc: "2.0",
+    id: rpcId,
+    error: {
+      code: -32603,
+      message: message
+    }
+  };
+  sendSseMessage(sessionId, errorResponse);
+}
+
 server.listen(PORT, () => {
-    console.log(`MCP Android Bridge ${PORT} portunda yayında.`);
+  console.log(`🚀 MCP & WebSocket Bridge sunucu ${PORT} portunda çalışıyor.`);
 });
