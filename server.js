@@ -6,7 +6,7 @@ const { randomUUID } = require('crypto');
 const app = express();
 app.use(express.json());
 
-// CORS Desteği
+// CORS Support
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -20,11 +20,11 @@ app.use((req, res, next) => {
 const server = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-// Aktif bağlantılar
-const browsers = new Map(); // deviceId -> WebSocket bağlantısı
+// Active connections
+const browsers = new Map(); // deviceId -> WebSocket connection
 const pendingRequests = new Map(); // messageId -> { resolve, reject, timeout }
 
-// Standart MCP Araç Şemaları
+// Standard MCP Tools schema
 const TOOLS = [
     {
         name: "browser_navigate",
@@ -33,7 +33,7 @@ const TOOLS = [
             type: "object",
             properties: {
                 url: { type: "string", description: "Gidilecek URL (örn. https://www.google.com)" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel, tek cihaz varsa otomatik seçilir)" }
             },
             required: ["url"]
         }
@@ -85,19 +85,19 @@ const TOOLS = [
     }
 ];
 
-// Bağlı tarayıcıyı bulma fonksiyonu
+// Helper to find connected browser
 function getBrowserWs(deviceId) {
     if (deviceId && browsers.has(deviceId)) {
         return browsers.get(deviceId);
     }
     if (browsers.size > 0) {
-        // Cihaz ID belirtilmediyse ilk bağlı tarayıcıyı otomatik seç
+        // Return first connected browser as default
         return Array.from(browsers.values())[0];
     }
     return null;
 }
 
-// Komutları Android tarayıcıya ileten fonksiyon
+// Helper to route command to Android browser and await result
 function routeCommandToBrowser(type, args, deviceId) {
     return new Promise((resolve, reject) => {
         const ws = getBrowserWs(deviceId);
@@ -119,32 +119,33 @@ function routeCommandToBrowser(type, args, deviceId) {
 
         pendingRequests.set(messageId, { resolve, reject, timeout });
         ws.send(payload);
-        console.log(`[Bridge] Komut gönderildi: '${type}' | ID: ${messageId}`);
+        console.log(`[Bridge] Sent command '${type}' to Android with ID: ${messageId}`);
     });
 }
 
-// Android WebSocket bağlantısını yükselt
+// Upgrade HTTP to WebSocket for Android app connection
 server.on('upgrade', (request, socket, head) => {
     wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
     });
 });
 
-// WebSocket Bağlantı Dinleyicisi (Android için)
+// WebSocket Server Handler (for Android App)
 wss.on('connection', (ws) => {
     let clientDeviceId = null;
-    console.log("[WS] Yeni bir cihaz bağlanmak istiyor...");
+    console.log("[WS] New connection attempt...");
 
     ws.on('message', (message) => {
         try {
             const payload = JSON.parse(message.toString());
-            console.log(`[WS] Gelen veri:`, payload);
+            console.log(`[WS] Received:`, payload);
 
             if (payload.type === 'register') {
                 clientDeviceId = payload.deviceId || `device_${Math.floor(Math.random() * 10000)}`;
                 browsers.set(clientDeviceId, ws);
-                console.log(`[WS] Android cihazı başarıyla kaydedildi: ${clientDeviceId}`);
+                console.log(`[WS] Android device successfully registered: ${clientDeviceId}`);
                 
+                // Send confirmation
                 ws.send(JSON.stringify({
                     type: "register_ack",
                     messageId: payload.messageId || "0",
@@ -159,27 +160,31 @@ wss.on('connection', (ws) => {
                     if (status === 'success') {
                         pending.resolve(data || {});
                     } else {
-                        pending.reject(new Error(error || "Bilinmeyen cihaz hatası"));
+                        pending.reject(new Error(error || "Unknown device error"));
                     }
                 }
             }
         } catch (err) {
-            console.error("[WS] Mesaj işleme hatası:", err);
+            console.error("[WS] Error parsing message:", err);
         }
     });
 
     ws.on('close', () => {
         if (clientDeviceId) {
             browsers.delete(clientDeviceId);
-            console.log(`[WS] Android cihazının bağlantısı koptu: ${clientDeviceId}`);
+            console.log(`[WS] Android device disconnected: ${clientDeviceId}`);
         }
+    });
+
+    ws.on('error', (err) => {
+        console.error(`[WS] Connection error:`, err);
     });
 });
 
 // ----------------------------------------------------
-// 1. STANDART MCP SSE APİ KANALLARI (Cursor ve Claude Desktop için)
+// 1. STANDARD MCP SSE TRANSPORT ENDPOINTS
 // ----------------------------------------------------
-const sseSessions = new Map();
+const sseSessions = new Map(); // sessionId -> response object
 
 app.get('/sse', (req, res) => {
     const sessionId = randomUUID();
@@ -187,31 +192,42 @@ app.get('/sse', (req, res) => {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
     });
 
+    // Send initial comment/heartbeat to establish connection immediately and bypass buffers
+    res.write(':\n\n');
+
+    // Keep SSE alive with heartbeats
     const heartbeatInterval = setInterval(() => {
         res.write(':\n\n');
     }, 15000);
 
     sseSessions.set(sessionId, res);
-    console.log(`[MCP] SSE oturumu oluşturuldu: ${sessionId}`);
+    console.log(`[MCP] SSE Session created: ${sessionId}`);
 
-    // AI istemcisine mesajları POST edeceği URL adresini bildiriyoruz
-    res.write(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`);
+    // Construct ABSOLUTE POST URL for MCP client to avoid relative path resolution bugs in clients like Cursor/Claude Desktop
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+    const host = req.headers['host'] || 'localhost:10000';
+    const postUrl = `${protocol}://${host}/message?sessionId=${sessionId}`;
+
+    console.log(`[MCP] Sending SSE endpoint redirect URL: ${postUrl}`);
+    res.write(`event: endpoint\ndata: ${postUrl}\n\n`);
 
     req.on('close', () => {
         clearInterval(heartbeatInterval);
         sseSessions.delete(sessionId);
-        console.log(`[MCP] SSE oturumu kapatıldı: ${sessionId}`);
+        console.log(`[MCP] SSE Session closed: ${sessionId}`);
     });
 });
 
+// Post endpoint for standard MCP client
 app.post('/message', async (req, res) => {
     const { sessionId } = req.query;
     const rpcRequest = req.body;
 
-    console.log(`[MCP] Gelen JSON-RPC İsteği:`, JSON.stringify(rpcRequest));
+    console.log(`[MCP] Incoming JSON-RPC Request (Session: ${sessionId}):`, JSON.stringify(rpcRequest));
 
     if (!rpcRequest || typeof rpcRequest !== 'object') {
         return res.status(400).json({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null });
@@ -219,6 +235,40 @@ app.post('/message', async (req, res) => {
 
     const { method, params, id } = rpcRequest;
 
+    // Handle notifications (no response required in JSON-RPC)
+    if (id === undefined || id === null) {
+        console.log(`[MCP] Received Notification: ${method}`);
+        return res.status(202).send();
+    }
+
+    // 1. Handle initialize handshake (CRITICAL for clients like Cursor / Claude Desktop)
+    if (method === 'initialize') {
+        return res.json({
+            jsonrpc: "2.0",
+            id,
+            result: {
+                protocolVersion: params?.protocolVersion || "2024-11-05",
+                capabilities: {
+                    tools: {} // We support tools
+                },
+                serverInfo: {
+                    name: "mcp-android-bridge",
+                    version: "1.0.0"
+                }
+            }
+        });
+    }
+
+    // 2. Handle ping
+    if (method === 'ping') {
+        return res.json({
+            jsonrpc: "2.0",
+            result: {},
+            id
+        });
+    }
+
+    // 3. Handle tools list
     if (method === 'tools/list') {
         return res.json({
             jsonrpc: "2.0",
@@ -227,11 +277,13 @@ app.post('/message', async (req, res) => {
         });
     }
 
+    // 4. Handle tools execution
     if (method === 'tools/call') {
         const toolName = params?.name;
         const args = params?.arguments || {};
         const deviceId = args.deviceId;
 
+        // Strip deviceId from args to avoid passing it to WebView
         const cleanArgs = { ...args };
         delete cleanArgs.deviceId;
 
@@ -245,7 +297,7 @@ app.post('/message', async (req, res) => {
             default:
                 return res.json({
                     jsonrpc: "2.0",
-                    error: { code: -32601, message: `Araç bulunamadı: ${toolName}` },
+                    error: { code: -32601, message: `Tool not found: ${toolName}` },
                     id
                 });
         }
@@ -281,11 +333,18 @@ app.post('/message', async (req, res) => {
         }
     }
 
-    return res.json({ jsonrpc: "2.0", result: {}, id });
+    // Default response for other unhandled methods
+    return res.json({
+        jsonrpc: "2.0",
+        result: {},
+        id
+    });
 });
 
 // ----------------------------------------------------
-// 2. DOĞRUDAN REST API BAĞLANTI NOKTALARI (404 Hatalarını Engelleme)
+// 2. DIRECT REST FALLBACK API ENDPOINTS
+// This is extremely important because some custom scripts or clients 
+// might hit these endpoints directly as REST APIs instead of full MCP.
 // ----------------------------------------------------
 const directToolHandler = async (type, req, res) => {
     const args = req.method === 'POST' ? req.body : req.query;
@@ -294,7 +353,7 @@ const directToolHandler = async (type, req, res) => {
     const cleanArgs = { ...args };
     delete cleanArgs.deviceId;
 
-    console.log(`[REST API] Doğrudan istek alındı '${type}':`, cleanArgs);
+    console.log(`[REST API] Direct request for '${type}':`, cleanArgs);
 
     try {
         const responseData = await routeCommandToBrowser(type, cleanArgs, deviceId);
@@ -304,15 +363,20 @@ const directToolHandler = async (type, req, res) => {
     }
 };
 
+// Map both GET, POST, and PUT to avoid 404s no matter what the client uses!
 const fallbackRoutes = [
     { path: '/mcp/tools/browser_navigate', type: 'navigate' },
     { path: '/tools/browser_navigate', type: 'navigate' },
+    
     { path: '/mcp/tools/browser_get_html', type: 'get_html' },
     { path: '/tools/browser_get_html', type: 'get_html' },
+    
     { path: '/mcp/tools/browser_scroll', type: 'scroll' },
     { path: '/tools/browser_scroll', type: 'scroll' },
+    
     { path: '/mcp/tools/browser_click', type: 'click' },
     { path: '/tools/browser_click', type: 'click' },
+    
     { path: '/mcp/tools/browser_execute_js', type: 'execute_js' },
     { path: '/tools/browser_execute_js', type: 'execute_js' }
 ];
@@ -323,6 +387,7 @@ fallbackRoutes.forEach(route => {
     });
 });
 
+// Information root endpoint
 app.get('/', (req, res) => {
     res.json({
         name: "MCP Android Browser Bridge Server",
@@ -333,10 +398,13 @@ app.get('/', (req, res) => {
     });
 });
 
+// Start listening
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
     console.log(`=================================================`);
-    console.log(` MCP Bridge Server port ${PORT} üzerinde çalışıyor.`);
-    console.log(` SSE Bağlantısı: http://localhost:${PORT}/sse`);
+    console.log(` MCP Bridge Server is running on port ${PORT}`);
+    console.log(` - Root Endpoint: http://localhost:${PORT}/`);
+    console.log(` - Standard MCP SSE: http://localhost:${PORT}/sse`);
+    console.log(` - Connected Devices Count: ${browsers.size}`);
     console.log(`=================================================`);
 });
