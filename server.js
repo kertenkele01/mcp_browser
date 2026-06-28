@@ -1,308 +1,342 @@
 const express = require('express');
+const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
-const http = require('http');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 
 const app = express();
 app.use(express.json());
 
-// Port Tanımlaması
-const PORT = process.env.PORT || 3000;
+// CORS Desteği
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-mcp-token');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
 
-// Bağlantı ve İstek Yönetimi
-let deviceWs = null; // Aktif Android Cihazı
-const mcpSessions = new Map(); // sessionId -> { res, pendingRequests }
-const pendingDeviceRequests = new Map(); // messageId -> { resolve, reject, timeout }
-
-// HTTP Sunucusu Oluşturma
-const server = http.createServer(app);
-
-// Android Uygulaması için WebSocket Sunucusu
+const server = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-server.on('upgrade', (request, socket, head) => {
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit('connection', ws, request);
-  });
-});
+// Aktif bağlantılar
+const browsers = new Map(); // deviceId -> WebSocket bağlantısı
+const pendingRequests = new Map(); // messageId -> { resolve, reject, timeout }
 
-wss.on('connection', (ws) => {
-  console.log('📱 Android cihazı WebSocket üzerinden bağlandı.');
-  
-  ws.on('message', (message) => {
-    try {
-      const payload = JSON.parse(message.toString());
-      console.log('📥 Cihazdan gelen veri:', payload);
-      
-      if (payload.type === 'register') {
-        deviceWs = ws;
-        console.log(`✅ Cihaz başarıyla kaydedildi. Cihaz ID: ${payload.deviceId}`);
-        ws.send(JSON.stringify({ type: 'registered', status: 'success' }));
-      } else if (payload.type === 'response') {
-        const pending = pendingDeviceRequests.get(payload.id);
-        if (pending) {
-          clearTimeout(pending.timeout);
-          pendingDeviceRequests.delete(payload.id);
-          if (payload.status === 'success') {
-            pending.resolve(payload.data || {});
-          } else {
-            pending.reject(new Error(payload.error || 'Cihaz işlem hatası'));
-          }
+// Standart MCP Araç Şemaları
+const TOOLS = [
+    {
+        name: "browser_navigate",
+        description: "Android tarayıcısında belirtilen web adresine (URL) gider.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                url: { type: "string", description: "Gidilecek URL (örn. https://www.google.com)" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            },
+            required: ["url"]
         }
-      }
-    } catch (e) {
-      console.error('❌ Cihaz mesajı ayrıştırılamadı:', e);
+    },
+    {
+        name: "browser_get_html",
+        description: "Şu an açık olan sayfanın HTML içeriğini (kaynağını) alır.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            }
+        }
+    },
+    {
+        name: "browser_scroll",
+        description: "Sayfayı yukarı veya aşağı kaydırır.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                direction: { type: "string", enum: ["up", "down"], description: "Kaydırma yönü ('up' veya 'down', varsayılan 'down')" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            }
+        }
+    },
+    {
+        name: "browser_click",
+        description: "Belirtilen CSS seçici (selector) ile eşleşen elemente tıklar.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                selector: { type: "string", description: "Tıklanacak elementin CSS seçicisi (örn. '#submit', '.btn-login')" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            },
+            required: ["selector"]
+        }
+    },
+    {
+        name: "browser_execute_js",
+        description: "Sayfada özel bir JavaScript kodu çalıştırır ve sonucunu döner.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                script: { type: "string", description: "Çalıştırılacak JS kod satırı" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            },
+            required: ["script"]
+        }
     }
-  });
+];
 
-  ws.on('close', () => {
-    console.log('❌ Cihaz bağlantısı kesildi.');
-    if (deviceWs === ws) {
-      deviceWs = null;
+// Bağlı tarayıcıyı bulma fonksiyonu
+function getBrowserWs(deviceId) {
+    if (deviceId && browsers.has(deviceId)) {
+        return browsers.get(deviceId);
     }
-  });
-});
-
-// Android Cihaza Komut Gönderip Yanıt Bekleyen Fonksiyon
-function sendCommandToDevice(type, args) {
-  return new Promise((resolve, reject) => {
-    if (!deviceWs) {
-      return reject(new Error('Android cihazı şu anda köprüye bağlı değil!'));
+    if (browsers.size > 0) {
+        // Cihaz ID belirtilmediyse ilk bağlı tarayıcıyı otomatik seç
+        return Array.from(browsers.values())[0];
     }
-    
-    const messageId = uuidv4();
-    const payload = {
-      id: messageId,
-      type: type,
-      ...args
-    };
-    
-    // 15 Saniyelik Zaman Aşımı (Timeout)
-    const timeout = setTimeout(() => {
-      pendingDeviceRequests.delete(messageId);
-      reject(new Error('Android cihazından zamanında yanıt alınamadı (Zaman Aşımı)'));
-    }, 15000);
-    
-    pendingDeviceRequests.set(messageId, { resolve, reject, timeout });
-    deviceWs.send(JSON.stringify(payload));
-    console.log(`🚀 Cihaza komut gönderildi: ${type} (ID: ${messageId})`);
-  });
+    return null;
 }
 
-// =================================================================
-// 🌐 MCP STANDART SSE PROTOKOLÜ ENDPOINTLERİ
-// =================================================================
+// Komutları Android tarayıcıya ileten fonksiyon
+function routeCommandToBrowser(type, args, deviceId) {
+    return new Promise((resolve, reject) => {
+        const ws = getBrowserWs(deviceId);
+        if (!ws) {
+            return reject(new Error("Bağlı aktif bir Android tarayıcı bulunamadı. Lütfen uygulamanın açık ve köprüye bağlı olduğundan emin olun."));
+        }
 
-// 1. SSE Bağlantısını Başlatma
-app.get('/sse', (req, res) => {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*'
-  });
+        const messageId = randomUUID();
+        const payload = JSON.stringify({
+            type,
+            messageId,
+            ...args
+        });
 
-  const sessionId = uuidv4();
-  mcpSessions.set(sessionId, { res, pendingRequests: new Map() });
-  
-  console.log(`🔌 Yeni MCP SSE Oturumu Açıldı: ${sessionId}`);
+        const timeout = setTimeout(() => {
+            pendingRequests.delete(messageId);
+            reject(new Error("Android cihazından yanıt alınamadı, zaman aşımı (15s)."));
+        }, 15000);
 
-  // Standart MCP gereği: İstemciye sonraki istekleri hangi URL'ye POST edeceğini bildiriyoruz
-  res.write(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`);
+        pendingRequests.set(messageId, { resolve, reject, timeout });
+        ws.send(payload);
+        console.log(`[Bridge] Komut gönderildi: '${type}' | ID: ${messageId}`);
+    });
+}
 
-  req.on('close', () => {
-    console.log(`❌ MCP SSE Oturumu Kapatıldı: ${sessionId}`);
-    mcpSessions.delete(sessionId);
-  });
+// Android WebSocket bağlantısını yükselt
+server.on('upgrade', (request, socket, head) => {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+    });
 });
 
-// 2. JSON-RPC Mesajlarını Karşılama (Cursor/Claude buradan konuşur)
+// WebSocket Bağlantı Dinleyicisi (Android için)
+wss.on('connection', (ws) => {
+    let clientDeviceId = null;
+    console.log("[WS] Yeni bir cihaz bağlanmak istiyor...");
+
+    ws.on('message', (message) => {
+        try {
+            const payload = JSON.parse(message.toString());
+            console.log(`[WS] Gelen veri:`, payload);
+
+            if (payload.type === 'register') {
+                clientDeviceId = payload.deviceId || `device_${Math.floor(Math.random() * 10000)}`;
+                browsers.set(clientDeviceId, ws);
+                console.log(`[WS] Android cihazı başarıyla kaydedildi: ${clientDeviceId}`);
+                
+                ws.send(JSON.stringify({
+                    type: "register_ack",
+                    messageId: payload.messageId || "0",
+                    status: "success"
+                }));
+            } else if (payload.type === 'response') {
+                const { messageId, status, data, error } = payload;
+                const pending = pendingRequests.get(messageId);
+                if (pending) {
+                    clearTimeout(pending.timeout);
+                    pendingRequests.delete(messageId);
+                    if (status === 'success') {
+                        pending.resolve(data || {});
+                    } else {
+                        pending.reject(new Error(error || "Bilinmeyen cihaz hatası"));
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("[WS] Mesaj işleme hatası:", err);
+        }
+    });
+
+    ws.on('close', () => {
+        if (clientDeviceId) {
+            browsers.delete(clientDeviceId);
+            console.log(`[WS] Android cihazının bağlantısı koptu: ${clientDeviceId}`);
+        }
+    });
+});
+
+// ----------------------------------------------------
+// 1. STANDART MCP SSE APİ KANALLARI (Cursor ve Claude Desktop için)
+// ----------------------------------------------------
+const sseSessions = new Map();
+
+app.get('/sse', (req, res) => {
+    const sessionId = randomUUID();
+    
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+    });
+
+    const heartbeatInterval = setInterval(() => {
+        res.write(':\n\n');
+    }, 15000);
+
+    sseSessions.set(sessionId, res);
+    console.log(`[MCP] SSE oturumu oluşturuldu: ${sessionId}`);
+
+    // AI istemcisine mesajları POST edeceği URL adresini bildiriyoruz
+    res.write(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`);
+
+    req.on('close', () => {
+        clearInterval(heartbeatInterval);
+        sseSessions.delete(sessionId);
+        console.log(`[MCP] SSE oturumu kapatıldı: ${sessionId}`);
+    });
+});
+
 app.post('/message', async (req, res) => {
-  const { sessionId } = req.query;
-  const jsonRpcRequest = req.body;
+    const { sessionId } = req.query;
+    const rpcRequest = req.body;
 
-  console.log(`📩 Gelen JSON-RPC İsteği (Oturum: ${sessionId}):`, JSON.stringify(jsonRpcRequest));
+    console.log(`[MCP] Gelen JSON-RPC İsteği:`, JSON.stringify(rpcRequest));
 
-  if (!jsonRpcRequest || jsonRpcRequest.jsonrpc !== '2.0') {
-    return res.status(400).json({ jsonrpc: '2.0', error: { code: -32600, message: 'Invalid Request' }, id: null });
-  }
-
-  const { method, params, id } = jsonRpcRequest;
-
-  // Standart MCP Başlatma (Handshake)
-  if (method === 'initialize') {
-    return res.json({
-      jsonrpc: '2.0',
-      id,
-      result: {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: {} },
-        serverInfo: { name: 'android-browser-mcp-bridge', version: '1.0.0' }
-      }
-    });
-  }
-
-  // Kullanılabilir Tool'ları AI'a Listeleme
-  if (method === 'tools/list') {
-    return res.json({
-      jsonrpc: '2.0',
-      id,
-      result: {
-        tools: [
-          {
-            name: 'browser_navigate',
-            description: 'Android tarayıcısını belirtilen URL adresine yönlendirir.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                url: { type: 'string', description: 'Yönlendirilecek tam URL (örn: https://google.com)' }
-              },
-              required: ['url']
-            }
-          },
-          {
-            name: 'browser_get_html',
-            description: 'Android tarayıcısının o anki web sayfasının HTML kaynak kodunu alır.',
-            inputSchema: { type: 'object', properties: {} }
-          },
-          {
-            name: 'browser_scroll',
-            description: 'Web sayfasını dikey veya yatay olarak kaydırır.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                x: { type: 'integer', description: 'Yatay kaydırma pikseli' },
-                y: { type: 'integer', description: 'Dikey kaydırma pikseli' }
-              },
-              required: ['x', 'y']
-            }
-          },
-          {
-            name: 'browser_click',
-            description: 'CSS seçici (selector) veya koordinatlar yardımıyla sayfada bir yere tıklar.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                selector: { type: 'string', description: 'Tıklanacak elementin CSS seçicisi' },
-                x: { type: 'integer', description: 'Alternatif X koordinatı' },
-                y: { type: 'integer', description: 'Alternatif Y koordinatı' }
-              }
-            }
-          },
-          {
-            name: 'browser_input_text',
-            description: 'Belirtilen CSS seçici alanına metin yazar.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                selector: { type: 'string', description: 'Metin girilecek alanın CSS seçicisi' },
-                text: { type: 'string', description: 'Yazılacak metin' }
-              },
-              required: ['selector', 'text']
-            }
-          },
-          {
-            name: 'browser_execute_js',
-            description: 'Tarayıcı içinde özel JavaScript kodu çalıştırır.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                code: { type: 'string', description: 'Çalıştırılacak JS kodu' }
-              },
-              required: ['code']
-            }
-          }
-        ]
-      }
-    });
-  }
-
-  // Tool Çağrısı (AI bir aracı tetiklediğinde)
-  if (method === 'tools/call') {
-    const toolName = params.name;
-    const toolArgs = params.arguments || {};
-
-    let deviceType = null;
-    let deviceArgs = {};
-
-    // MCP Tool Adını Android'in WebSocket yapısıyla eşleme
-    if (toolName === 'browser_navigate') {
-      deviceType = 'navigate';
-      deviceArgs = { url: toolArgs.url };
-    } else if (toolName === 'browser_get_html') {
-      deviceType = 'get_html';
-    } else if (toolName === 'browser_scroll') {
-      deviceType = 'scroll';
-      deviceArgs = { x: parseInt(toolArgs.x), y: parseInt(toolArgs.y) };
-    } else if (toolName === 'browser_click') {
-      deviceType = 'click';
-      deviceArgs = { selector: toolArgs.selector, x: toolArgs.x, y: toolArgs.y };
-    } else if (toolName === 'browser_input_text') {
-      deviceType = 'input_text';
-      deviceArgs = { selector: toolArgs.selector, text: toolArgs.text };
-    } else if (toolName === 'browser_execute_js') {
-      deviceType = 'execute_js';
-      deviceArgs = { code: toolArgs.code };
+    if (!rpcRequest || typeof rpcRequest !== 'object') {
+        return res.status(400).json({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null });
     }
 
-    if (!deviceType) {
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        error: { code: -32601, message: `Araç (${toolName}) bulunamadı.` }
-      });
+    const { method, params, id } = rpcRequest;
+
+    if (method === 'tools/list') {
+        return res.json({
+            jsonrpc: "2.0",
+            result: { tools: TOOLS },
+            id
+        });
     }
+
+    if (method === 'tools/call') {
+        const toolName = params?.name;
+        const args = params?.arguments || {};
+        const deviceId = args.deviceId;
+
+        const cleanArgs = { ...args };
+        delete cleanArgs.deviceId;
+
+        let actionType = "";
+        switch (toolName) {
+            case "browser_navigate": actionType = "navigate"; break;
+            case "browser_get_html": actionType = "get_html"; break;
+            case "browser_scroll": actionType = "scroll"; break;
+            case "browser_click": actionType = "click"; break;
+            case "browser_execute_js": actionType = "execute_js"; break;
+            default:
+                return res.json({
+                    jsonrpc: "2.0",
+                    error: { code: -32601, message: `Araç bulunamadı: ${toolName}` },
+                    id
+                });
+        }
+
+        try {
+            const responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId);
+            return res.json({
+                jsonrpc: "2.0",
+                result: {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify(responseData, null, 2)
+                        }
+                    ]
+                },
+                id
+            });
+        } catch (error) {
+            return res.json({
+                jsonrpc: "2.0",
+                result: {
+                    isError: true,
+                    content: [
+                        {
+                            type: "text",
+                            text: `Hata: ${error.message}`
+                        }
+                    ]
+                },
+                id
+            });
+        }
+    }
+
+    return res.json({ jsonrpc: "2.0", result: {}, id });
+});
+
+// ----------------------------------------------------
+// 2. DOĞRUDAN REST API BAĞLANTI NOKTALARI (404 Hatalarını Engelleme)
+// ----------------------------------------------------
+const directToolHandler = async (type, req, res) => {
+    const args = req.method === 'POST' ? req.body : req.query;
+    const deviceId = args.deviceId;
+    
+    const cleanArgs = { ...args };
+    delete cleanArgs.deviceId;
+
+    console.log(`[REST API] Doğrudan istek alındı '${type}':`, cleanArgs);
 
     try {
-      // Android Cihaza komutu ilet ve yanıtı bekle
-      const deviceResult = await sendCommandToDevice(deviceType, deviceArgs);
-      
-      // Standart MCP JSON-RPC formatında yanıt dön
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: typeof deviceResult === 'string' ? deviceResult : JSON.stringify(deviceResult, null, 2)
-            }
-          ]
-        }
-      });
+        const responseData = await routeCommandToBrowser(type, cleanArgs, deviceId);
+        return res.json({ status: "success", data: responseData });
     } catch (error) {
-      return res.json({
-        jsonrpc: '2.0',
-        id,
-        result: {
-          isError: true,
-          content: [
-            {
-              type: 'text',
-              text: `Hata Oluştu: ${error.message}`
-            }
-          ]
-        }
-      });
+        return res.status(500).json({ status: "error", error: error.message });
     }
-  }
+};
 
-  return res.json({
-    jsonrpc: '2.0',
-    id,
-    error: { code: -32601, message: 'Method bulunamadı.' }
-  });
+const fallbackRoutes = [
+    { path: '/mcp/tools/browser_navigate', type: 'navigate' },
+    { path: '/tools/browser_navigate', type: 'navigate' },
+    { path: '/mcp/tools/browser_get_html', type: 'get_html' },
+    { path: '/tools/browser_get_html', type: 'get_html' },
+    { path: '/mcp/tools/browser_scroll', type: 'scroll' },
+    { path: '/tools/browser_scroll', type: 'scroll' },
+    { path: '/mcp/tools/browser_click', type: 'click' },
+    { path: '/tools/browser_click', type: 'click' },
+    { path: '/mcp/tools/browser_execute_js', type: 'execute_js' },
+    { path: '/tools/browser_execute_js', type: 'execute_js' }
+];
+
+fallbackRoutes.forEach(route => {
+    app.all(route.path, (req, res) => {
+        directToolHandler(route.type, req, res);
+    });
 });
 
-// Durum Ekranı
 app.get('/', (req, res) => {
-  res.json({
-    status: 'online',
-    deviceConnected: !!deviceWs,
-    activeMcpSessions: mcpSessions.size
-  });
+    res.json({
+        name: "MCP Android Browser Bridge Server",
+        status: "running",
+        connected_browsers: Array.from(browsers.keys()),
+        mcp_sse_endpoint: "/sse",
+        supported_tools: TOOLS.map(t => t.name)
+    });
 });
 
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`🚀 MCP Köprü Sunucusu ${PORT} portunda çalışıyor.`);
+    console.log(`=================================================`);
+    console.log(` MCP Bridge Server port ${PORT} üzerinde çalışıyor.`);
+    console.log(` SSE Bağlantısı: http://localhost:${PORT}/sse`);
+    console.log(`=================================================`);
 });
