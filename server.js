@@ -28,11 +28,11 @@ const pendingRequests = new Map(); // messageId -> { resolve, reject, timeout }
 const TOOLS = [
     {
         name: "browser_navigate",
-        description: "Android tarayıcısında belirtilen web adresine (URL) gider.",
+        description: "Android tarayıcısında belirtilen web adresine (URL) gider.(sadece metin yazmak google de arama yapar.)",
         inputSchema: {
             type: "object",
             properties: {
-                url: { type: "string", description: "Gidilecek URL (örn. https://www.google.com)" },
+                url: { type: "string", description: "Gidilecek URL (örn. https://www.google.com)(veya sadece metin yaz ve google de arama yapsın)" },
                 deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel, tek cihaz varsa otomatik seçilir)" }
             },
             required: ["url"]
