@@ -148,6 +148,16 @@ const TOOLS = [
             },
             required: ["enabled"]
         }
+    },
+    {
+        name: "browser_screenshot",
+        description: "Şu an açık olan tarayıcı ekranının görüntüsünü (screenshot) alır. AI vision modelleri için son derece kullanışlıdır.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            }
+        }
     }
 ];
 
@@ -405,6 +415,7 @@ app.post('/message', async (req, res) => {
             case "browser_click": actionType = "click"; break;
             case "browser_type": actionType = "type"; break;
             case "browser_toggle_overlay": actionType = "toggle_overlay"; break;
+            case "browser_screenshot": actionType = "screenshot"; break;
             case "browser_execute_js": actionType = "execute_js"; break;
             default:
                 reply(null, { code: -32601, message: `Tool not found: ${toolName}` });
@@ -433,14 +444,33 @@ app.post('/message', async (req, res) => {
 
             addLog(sessionId, clientName, deviceId || 'Varsayılan Cihaz', `Yürütme Başarılı: ${toolName}`, 'success', details);
 
-            reply({
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify(responseData, null, 2)
-                    }
-                ]
-            });
+            const content = [];
+            
+            if (responseData && responseData.screenshot) {
+                const screenshotBase64 = responseData.screenshot;
+                
+                // Keep the JSON response clean by removing the massive base64 string from text output
+                const cleanResponseData = { ...responseData };
+                delete cleanResponseData.screenshot;
+                
+                content.push({
+                    type: "text",
+                    text: JSON.stringify(cleanResponseData, null, 2)
+                });
+                
+                content.push({
+                    type: "image",
+                    data: screenshotBase64,
+                    mimeType: "image/jpeg"
+                });
+            } else {
+                content.push({
+                    type: "text",
+                    text: JSON.stringify(responseData, null, 2)
+                });
+            }
+
+            reply({ content });
         } catch (error) {
             addLog(sessionId, clientName, deviceId || 'Varsayılan Cihaz', `Hata: ${toolName}`, 'error', error.message);
             reply({
@@ -509,6 +539,9 @@ const fallbackRoutes = [
 
     { path: '/mcp/tools/browser_toggle_overlay', type: 'toggle_overlay' },
     { path: '/tools/browser_toggle_overlay', type: 'toggle_overlay' },
+    
+    { path: '/mcp/tools/browser_screenshot', type: 'screenshot' },
+    { path: '/tools/browser_screenshot', type: 'screenshot' },
     
     { path: '/mcp/tools/browser_execute_js', type: 'execute_js' },
     { path: '/tools/browser_execute_js', type: 'execute_js' }
