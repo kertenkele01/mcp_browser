@@ -123,6 +123,31 @@ const TOOLS = [
             },
             required: ["script"]
         }
+    },
+    {
+        name: "browser_type",
+        description: "Belirtilen input/text alanına yazı girer. Selector olarak Vimium ID sayısı (örn. '12') veya CSS seçici kullanılabilir.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                selector: { type: "string", description: "Yazı girilecek elementin CSS seçicisi veya Vimium ID sayısı (örn. '15')" },
+                text: { type: "string", description: "Girilecek metin" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            },
+            required: ["selector", "text"]
+        }
+    },
+    {
+        name: "browser_toggle_overlay",
+        description: "Ekrandaki interaktif elementlerin üzerine Vimium-style görsel numaralandırma etiketleri (overlay) ekler veya kaldırır.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                enabled: { type: "boolean", description: "Overlay açık (true) veya kapalı (false) olsun" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            },
+            required: ["enabled"]
+        }
     }
 ];
 
@@ -378,6 +403,8 @@ app.post('/message', async (req, res) => {
             case "browser_get_markdown": actionType = "get_markdown"; break;
             case "browser_scroll": actionType = "scroll"; break;
             case "browser_click": actionType = "click"; break;
+            case "browser_type": actionType = "type"; break;
+            case "browser_toggle_overlay": actionType = "toggle_overlay"; break;
             case "browser_execute_js": actionType = "execute_js"; break;
             default:
                 reply(null, { code: -32601, message: `Tool not found: ${toolName}` });
@@ -476,6 +503,12 @@ const fallbackRoutes = [
     
     { path: '/mcp/tools/browser_click', type: 'click' },
     { path: '/tools/browser_click', type: 'click' },
+    
+    { path: '/mcp/tools/browser_type', type: 'type' },
+    { path: '/tools/browser_type', type: 'type' },
+
+    { path: '/mcp/tools/browser_toggle_overlay', type: 'toggle_overlay' },
+    { path: '/tools/browser_toggle_overlay', type: 'toggle_overlay' },
     
     { path: '/mcp/tools/browser_execute_js', type: 'execute_js' },
     { path: '/tools/browser_execute_js', type: 'execute_js' }
