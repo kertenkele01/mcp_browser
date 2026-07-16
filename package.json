@@ -1,5 +1,4 @@
-{
-  "name": "mcp-android-bridge",
+"name": "mcp-android-bridge",
   "version": "1.0.0",
   "description": "Android Browser Model Context Protocol (MCP) Bridge Server for Render and local environments",
   "main": "server.js",
@@ -21,4 +20,3 @@
   ],
   "author": "",
   "license": "ISC"
-}
