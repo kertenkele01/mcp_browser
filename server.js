@@ -71,7 +71,7 @@ const TOOLS = [
     },
     {
         name: "browser_get_html",
-        description: "Şu an açık olan sayfanın saf (raw) HTML içeriğini (kaynağını) alır.",
+        description: "Şu an açık olan sayfanın Turndown kütüphanesi (HTML-to-Markdown) ile dönüştürülmüş standart Markdown çıktısını (`turndown_markdown`) ve temizlenmiş HTML kaynağını (`html`) alır.",
         inputSchema: {
             type: "object",
             properties: {
@@ -81,7 +81,7 @@ const TOOLS = [
     },
     {
         name: "browser_get_markdown",
-        description: "Şu an açık olan sayfanın temizlenmiş, sadeleştirilmiş ve hiyerarşik Markdown içeriğini alır. AI modelleri için en uygun formattır.",
+        description: "Şu an açık olan sayfanın temizlenmiş, gürültüsüz Markdown içeriğini ve tüm tıklanabilir/form elemanlarının (buton, tarih, form girdileri, açılır menüler) otomatik 'ID' tablosunu alır. AI modellerinin sayfayı anında anlayıp aksiyon alması için en ideal formattır.",
         inputSchema: {
             type: "object",
             properties: {
@@ -102,11 +102,11 @@ const TOOLS = [
     },
     {
         name: "browser_click",
-        description: "Belirtilen CSS seçici (selector) ile eşleşen elemente tıklar.",
+        description: "Belirtilen element ID sayısı (örn. '1' veya '5'), Vimium etiketi, CSS seçici veya metin ('text=Uçuş Ara') ile eşleşen öğeye tıklar.",
         inputSchema: {
             type: "object",
             properties: {
-                selector: { type: "string", description: "Tıklanacak elementin CSS seçicisi (örn. '#submit', '.btn-login')" },
+                selector: { type: "string", description: "Tıklanacak elementin ID sayısı (örn. '1'), Vimium etiketi, CSS seçicisi veya metni (örn. 'text=Arama Yap')" },
                 deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
             },
             required: ["selector"]
@@ -118,7 +118,7 @@ const TOOLS = [
         inputSchema: {
             type: "object",
             properties: {
-                script: { type: "string", description: "Çaimsal JS kod satırı" },
+                script: { type: "string", description: "Çalıştırılacak JS kod satırı" },
                 deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
             },
             required: ["script"]
@@ -126,12 +126,12 @@ const TOOLS = [
     },
     {
         name: "browser_type",
-        description: "Belirtilen input/text alanına yazı girer. Selector olarak Vimium ID sayısı (örn. '12') veya CSS seçici kullanılabilir.",
+        description: "Belirtilen input/text/tarih alanına yazı girer. Selector olarak element ID sayısı (örn. '2'), Vimium ID sayısı veya CSS seçici kullanılabilir.",
         inputSchema: {
             type: "object",
             properties: {
-                selector: { type: "string", description: "Yazı girilecek elementin CSS seçicisi veya Vimium ID sayısı (örn. '15')" },
-                text: { type: "string", description: "Girilecek metin" },
+                selector: { type: "string", description: "Yazı girilecek elementin ID sayısı (örn. '2') veya CSS seçicisi" },
+                text: { type: "string", description: "Girilecek metin veya tarih (örn. 'İstanbul' veya '2026-08-15')" },
                 deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
             },
             required: ["selector", "text"]
@@ -427,8 +427,38 @@ app.post('/message', async (req, res) => {
 
         try {
             addLog(sessionId, clientName, deviceId || 'Varsayılan Cihaz', `Araç Çağrısı: ${toolName}`, 'pending', `Komut gönderiliyor. Parametreler: ${JSON.stringify(cleanArgs)}`);
-            const responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId);
+            let responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId);
             
+            // If real Crawl4AI API service is configured, process HTML through official Crawl4AI Python Engine!
+            if (toolName === "browser_get_markdown" && process.env.CRAWL4AI_API_URL && (responseData.html || responseData.url)) {
+                try {
+                    console.log(`[Crawl4AI] Forwarding page HTML/URL to Crawl4AI Engine: ${process.env.CRAWL4AI_API_URL}`);
+                    const crawlRes = await fetch(process.env.CRAWL4AI_API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            url: responseData.url || '',
+                            html: responseData.html || '',
+                            word_count_threshold: 10,
+                            css_selector: 'body'
+                        })
+                    });
+
+                    if (crawlRes.ok) {
+                        const crawlJson = await crawlRes.json();
+                        if (crawlJson && (crawlJson.markdown || crawlJson.result)) {
+                            const authenticMarkdown = crawlJson.markdown || crawlJson.result;
+                            console.log(`[Crawl4AI] Successfully received official Crawl4AI markdown (${authenticMarkdown.length} chars)!`);
+                            responseData.markdown = authenticMarkdown;
+                            responseData.crawl4ai_markdown = authenticMarkdown;
+                            responseData.engine_used = "Official Crawl4AI Python Engine";
+                        }
+                    }
+                } catch (c4err) {
+                    console.error(`[Crawl4AI] Python Service call failed: ${c4err.message}`);
+                }
+            }
+
             let details = "Komut başarıyla yürütüldü.";
             if (toolName === "browser_get_markdown" && responseData.markdown) {
                 details = `Markdown verisi başarıyla alındı. (${responseData.markdown.length} karakter)`;
