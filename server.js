@@ -71,7 +71,7 @@ const TOOLS = [
     },
     {
         name: "browser_get_html",
-        description: "Şu an açık olan sayfanın Turndown kütüphanesi (HTML-to-Markdown) ile dönüştürülmüş standart Markdown çıktısını (`turndown_markdown`) ve temizlenmiş HTML kaynağını (`html`) alır.",
+        description: "Şu an açık olan sayfanın saf HTML kaynağını (`html`) ve eski/özel JS Markdown dönüştürücümüzün interaktif ID tablolu çıktısını (`custom_markdown` / `turndown_markdown`) alır.",
         inputSchema: {
             type: "object",
             properties: {
@@ -81,7 +81,7 @@ const TOOLS = [
     },
     {
         name: "browser_get_markdown",
-        description: "Şu an açık olan sayfanın temizlenmiş, gürültüsüz Markdown içeriğini ve tüm tıklanabilir/form elemanlarının (buton, tarih, form girdileri, açılır menüler) otomatik 'ID' tablosunu alır. AI modellerinin sayfayı anında anlayıp aksiyon alması için en ideal formattır.",
+        description: "Şu an açık olan sayfanın Crawl4AI Python motoru üretimi Markdown içeriğini (`markdown` / `crawl4ai_markdown`) ve eski/özel JS dönüştürücümüzün çıktısını (`custom_markdown`) alır.",
         inputSchema: {
             type: "object",
             properties: {
@@ -155,8 +155,53 @@ const TOOLS = [
         inputSchema: {
             type: "object",
             properties: {
+                tabId: { type: "string", description: "Hedef sekme ID'si (opsiyonel)" },
                 deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
             }
+        }
+    },
+    {
+        name: "browser_new_tab",
+        description: "Mevcut AI oturumunda yeni bir sekme açar.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                url: { type: "string", description: "Açılacak URL adresi (opsiyonel, varsayılan google.com)" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            }
+        }
+    },
+    {
+        name: "browser_close_tab",
+        description: "Mevcut AI oturumunda bir sekkeyi veya aktif sekkeyi kapatır.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                tabId: { type: "string", description: "Kapatılacak sekme ID'si (opsiyonel, belirtilmezse aktif sekme kapatılır)" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            }
+        }
+    },
+    {
+        name: "browser_list_tabs",
+        description: "Bu AI oturumuna ait tüm açık sekmeleri listeler.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            }
+        }
+    },
+    {
+        name: "browser_switch_tab",
+        description: "Belirtilen sekmeye geçiş yapar.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                tabId: { type: "string", description: "Geçiş yapılacak sekme ID'si" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            },
+            required: ["tabId"]
         }
     }
 ];
@@ -174,7 +219,7 @@ function getBrowserWs(deviceId) {
 }
 
 // Helper to route command to Android browser and await result
-function routeCommandToBrowser(type, args, deviceId) {
+function routeCommandToBrowser(type, args, deviceId, sessionId = 'default_session', clientName = 'Yapay Zeka') {
     return new Promise((resolve, reject) => {
         const ws = getBrowserWs(deviceId);
         if (!ws) {
@@ -185,6 +230,8 @@ function routeCommandToBrowser(type, args, deviceId) {
         const payload = JSON.stringify({
             type,
             messageId,
+            sessionId,
+            clientName,
             ...args
         });
 
@@ -195,7 +242,7 @@ function routeCommandToBrowser(type, args, deviceId) {
 
         pendingRequests.set(messageId, { resolve, reject, timeout });
         ws.send(payload);
-        console.log(`[Bridge] Sent command '${type}' to Android with ID: ${messageId}`);
+        console.log(`[Bridge] Sent command '${type}' (Session: ${sessionId}, Client: ${clientName}) to Android with ID: ${messageId}`);
     });
 }
 
@@ -417,6 +464,10 @@ app.post('/message', async (req, res) => {
             case "browser_toggle_overlay": actionType = "toggle_overlay"; break;
             case "browser_screenshot": actionType = "screenshot"; break;
             case "browser_execute_js": actionType = "execute_js"; break;
+            case "browser_new_tab": actionType = "new_tab"; break;
+            case "browser_close_tab": actionType = "close_tab"; break;
+            case "browser_list_tabs": actionType = "list_tabs"; break;
+            case "browser_switch_tab": actionType = "switch_tab"; break;
             default:
                 reply(null, { code: -32601, message: `Tool not found: ${toolName}` });
                 return res.status(200).send("accepted");
@@ -427,15 +478,30 @@ app.post('/message', async (req, res) => {
 
         try {
             addLog(sessionId, clientName, deviceId || 'Varsayılan Cihaz', `Araç Çağrısı: ${toolName}`, 'pending', `Komut gönderiliyor. Parametreler: ${JSON.stringify(cleanArgs)}`);
-            let responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId);
+            let responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId, sessionId, clientName);
             
+            // Preserve our custom JS engine's Markdown output before Crawl4AI processing
+            if (responseData && (responseData.markdown || responseData.turndown_markdown)) {
+                responseData.custom_markdown = responseData.markdown || responseData.turndown_markdown;
+            }
+
+            // Ensure browser_get_html also includes our custom_markdown clearly
+            if (toolName === "browser_get_html" && responseData && !responseData.custom_markdown) {
+                responseData.custom_markdown = responseData.turndown_markdown || responseData.markdown || "";
+            }
+
             // If real Crawl4AI API service is configured, process HTML through official Crawl4AI Python Engine!
             if (toolName === "browser_get_markdown" && process.env.CRAWL4AI_API_URL && (responseData.html || responseData.url)) {
                 try {
                     console.log(`[Crawl4AI] Forwarding page HTML/URL to Crawl4AI Engine: ${process.env.CRAWL4AI_API_URL}`);
                     const crawlRes = await fetch(process.env.CRAWL4AI_API_URL, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: { 
+                            'Content-Type': 'application/json',
+                            'Bypass-Tunnel-Reminder': 'true',
+                            'User-Agent': 'MCP-Server/1.0'
+                        },
+                        signal: AbortSignal.timeout(12000), // 12 seconds max timeout to avoid hanging MCP tool calls
                         body: JSON.stringify({
                             url: responseData.url || '',
                             html: responseData.html || '',
@@ -448,14 +514,21 @@ app.post('/message', async (req, res) => {
                         const crawlJson = await crawlRes.json();
                         if (crawlJson && (crawlJson.markdown || crawlJson.result)) {
                             const authenticMarkdown = crawlJson.markdown || crawlJson.result;
-                            console.log(`[Crawl4AI] Successfully received official Crawl4AI markdown (${authenticMarkdown.length} chars)!`);
-                            responseData.markdown = authenticMarkdown;
-                            responseData.crawl4ai_markdown = authenticMarkdown;
-                            responseData.engine_used = "Official Crawl4AI Python Engine";
+                            if (authenticMarkdown && authenticMarkdown !== "None" && authenticMarkdown.trim().length > 0) {
+                                console.log(`[Crawl4AI] Successfully received official Crawl4AI markdown (${authenticMarkdown.length} chars)!`);
+                                responseData.markdown = authenticMarkdown;
+                                responseData.crawl4ai_markdown = authenticMarkdown;
+                                responseData.engine_used = "Official Crawl4AI Python Engine";
+                                if (crawlJson.fit_markdown && crawlJson.fit_markdown !== "None") responseData.fit_markdown = crawlJson.fit_markdown;
+                                if (crawlJson.raw_markdown && crawlJson.raw_markdown !== "None") responseData.raw_markdown = crawlJson.raw_markdown;
+                                if (crawlJson.citations_markdown && crawlJson.citations_markdown !== "None") responseData.citations_markdown = crawlJson.citations_markdown;
+                            }
                         }
+                    } else {
+                        console.warn(`[Crawl4AI] Service returned HTTP ${crawlRes.status}`);
                     }
                 } catch (c4err) {
-                    console.error(`[Crawl4AI] Python Service call failed: ${c4err.message}`);
+                    console.error(`[Crawl4AI] Python Service call skipped or failed: ${c4err.message}`);
                 }
             }
 
