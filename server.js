@@ -276,15 +276,15 @@ wss.on('connection', (ws) => {
                     status: "success"
                 }));
             } else if (payload.type === 'response') {
-                const { messageId, status, data, error } = payload;
+                const { messageId, status, success, data, error } = payload;
                 const pending = pendingRequests.get(messageId);
                 if (pending) {
                     clearTimeout(pending.timeout);
                     pendingRequests.delete(messageId);
-                    if (status === 'success') {
+                    if (status === 'success' || success === true) {
                         pending.resolve(data || {});
                     } else {
-                        pending.reject(new Error(error || "Unknown device error"));
+                        pending.reject(new Error(error || "Cihaz işlem hatası"));
                     }
                 }
             }
