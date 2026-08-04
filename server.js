@@ -206,29 +206,65 @@ const TOOLS = [
     }
 ];
 
-// Helper to find connected browser
-function getBrowserWs(deviceId) {
-    if (deviceId && browsers.has(deviceId)) {
-        const ws = browsers.get(deviceId);
-        if (ws && ws.readyState === 1) { // 1 = OPEN
-            return ws;
+// Helper to find connected browser with sticky session-to-device binding & inactivity timeout
+function getBrowserWsForSession(sessionId, requestedDeviceId) {
+    const sseSess = sseSessions.get(sessionId);
+    const now = Date.now();
+    const BINDING_TIMEOUT_MS = 2 * 60 * 1000; // 2 dakikalık inaktivite zaman aşımı
+
+    // Eğer AI 2 dakika boyunca tool çağırmadıysa cihaz eşleşmesini otomatik sıfırla
+    if (sseSess && sseSess.boundDeviceId && sseSess.lastToolCallTime) {
+        if (now - sseSess.lastToolCallTime > BINDING_TIMEOUT_MS) {
+            console.log(`[MCP] Oturum '${sessionId}' 2 dakikadır işlem yapmadı. Bağlı cihaz ('${sseSess.boundDeviceId}') eşleşmesi sıfırlandı.`);
+            delete sseSess.boundDeviceId;
         }
-        browsers.delete(deviceId);
     }
+
+    // 1. AI açıkça belirli bir deviceId talep ettiyse onu kullan ve eşleştir
+    if (requestedDeviceId && browsers.has(requestedDeviceId)) {
+        const ws = browsers.get(requestedDeviceId);
+        if (ws && ws.readyState === 1) { // 1 = OPEN
+            if (sseSess) {
+                sseSess.boundDeviceId = requestedDeviceId;
+                sseSess.lastToolCallTime = now;
+            }
+            return { ws, deviceId: requestedDeviceId };
+        }
+        browsers.delete(requestedDeviceId);
+    }
+
+    // 2. Bu oturumun aktif ve hâlâ online olan bir cihaz eşleşmesi var mı kontrol et
+    if (sseSess && sseSess.boundDeviceId && browsers.has(sseSess.boundDeviceId)) {
+        const boundWs = browsers.get(sseSess.boundDeviceId);
+        if (boundWs && boundWs.readyState === 1) {
+            sseSess.lastToolCallTime = now;
+            return { ws: boundWs, deviceId: sseSess.boundDeviceId };
+        }
+        console.log(`[MCP] Bağlı cihaz '${sseSess.boundDeviceId}' koptu. '${sessionId}' oturumuna yeni bir cihaz atanacak.`);
+        delete sseSess.boundDeviceId;
+    }
+
+    // 3. Varsayılan: Bağlı ilk aktif Android cihazı seç ve bu oturuma eşle
     for (const [id, ws] of browsers.entries()) {
         if (ws && ws.readyState === 1) {
-            return ws;
+            if (sseSess) {
+                sseSess.boundDeviceId = id;
+                sseSess.lastToolCallTime = now;
+                console.log(`[MCP] Oturum '${sessionId}' için Android cihazı eşleştirildi: '${id}'`);
+            }
+            return { ws, deviceId: id };
         } else {
             browsers.delete(id);
         }
     }
-    return null;
+
+    return { ws: null, deviceId: null };
 }
 
 // Helper to route command to Android browser and await result
-function routeCommandToBrowser(type, args, deviceId, sessionId = 'default_session', clientName = 'Yapay Zeka') {
+function routeCommandToBrowser(type, args, targetDeviceId, sessionId = 'default_session', clientName = 'Yapay Zeka') {
     return new Promise((resolve, reject) => {
-        const ws = getBrowserWs(deviceId);
+        const { ws, deviceId } = getBrowserWsForSession(sessionId, targetDeviceId);
         if (!ws) {
             return reject(new Error("Bağlı aktif bir Android tarayıcı bulunamadı. Lütfen uygulamanın açık ve köprüye bağlı olduğundan emin olun."));
         }
@@ -244,12 +280,22 @@ function routeCommandToBrowser(type, args, deviceId, sessionId = 'default_sessio
 
         const timeout = setTimeout(() => {
             pendingRequests.delete(messageId);
-            reject(new Error("Android cihazından yanıt alınamadı, zaman aşımı (15s)."));
+            reject(new Error(`Android cihazından (${deviceId}) yanıt alınamadı, zaman aşımı (15s).`));
         }, 15000);
 
-        pendingRequests.set(messageId, { resolve, reject, timeout });
+        pendingRequests.set(messageId, { 
+            resolve: (val) => {
+                // Attach assigned deviceId to response object
+                if (val && typeof val === 'object' && !Array.isArray(val)) {
+                    val.deviceId = deviceId;
+                }
+                resolve(val);
+            }, 
+            reject, 
+            timeout 
+        });
         ws.send(payload);
-        console.log(`[Bridge] Sent command '${type}' (Session: ${sessionId}, Client: ${clientName}) to Android with ID: ${messageId}`);
+        console.log(`[Bridge] Sent command '${type}' (Session: ${sessionId}, Client: ${clientName}, TargetDevice: ${deviceId}) with ID: ${messageId}`);
     });
 }
 
