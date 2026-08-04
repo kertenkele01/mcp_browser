@@ -209,11 +209,18 @@ const TOOLS = [
 // Helper to find connected browser
 function getBrowserWs(deviceId) {
     if (deviceId && browsers.has(deviceId)) {
-        return browsers.get(deviceId);
+        const ws = browsers.get(deviceId);
+        if (ws && ws.readyState === 1) { // 1 = OPEN
+            return ws;
+        }
+        browsers.delete(deviceId);
     }
-    if (browsers.size > 0) {
-        // Return first connected browser as default
-        return Array.from(browsers.values())[0];
+    for (const [id, ws] of browsers.entries()) {
+        if (ws && ws.readyState === 1) {
+            return ws;
+        } else {
+            browsers.delete(id);
+        }
     }
     return null;
 }
@@ -265,6 +272,11 @@ wss.on('connection', (ws) => {
 
             if (payload.type === 'register') {
                 clientDeviceId = payload.deviceId || `device_${Math.floor(Math.random() * 10000)}`;
+                const existingWs = browsers.get(clientDeviceId);
+                if (existingWs && existingWs !== ws) {
+                    console.log(`[WS] Replacing existing connection for device: ${clientDeviceId}`);
+                    try { existingWs.close(1000, "Replaced by new connection"); } catch (e) {}
+                }
                 browsers.set(clientDeviceId, ws);
                 console.log(`[WS] Android device successfully registered: ${clientDeviceId}`);
                 addLog(null, 'Android Uygulaması', clientDeviceId, 'Cihaz Bağlantısı', 'success', 'Cihaz köprüye başarıyla bağlandı ve kullanıma hazır.');
@@ -273,7 +285,21 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({
                     type: "register_ack",
                     messageId: payload.messageId || "0",
+                    deviceId: clientDeviceId,
                     status: "success"
+                }));
+            } else if (payload.type === 'ping') {
+                if (payload.deviceId) {
+                    clientDeviceId = payload.deviceId;
+                    if (browsers.get(clientDeviceId) !== ws) {
+                        browsers.set(clientDeviceId, ws);
+                        console.log(`[WS] Re-bound active socket for device: ${clientDeviceId}`);
+                    }
+                }
+                ws.send(JSON.stringify({
+                    type: "pong",
+                    deviceId: clientDeviceId,
+                    timestamp: Date.now()
                 }));
             } else if (payload.type === 'response') {
                 const { messageId, status, success, data, error } = payload;
@@ -295,16 +321,32 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         if (clientDeviceId) {
-            browsers.delete(clientDeviceId);
-            console.log(`[WS] Android device disconnected: ${clientDeviceId}`);
-            addLog(null, 'Android Uygulaması', clientDeviceId, 'Cihaz Ayrıldı', 'info', 'Cihaz bağlantıyı kapattı.');
+            // ONLY delete from browsers map if THIS exact socket is still the registered active socket!
+            if (browsers.get(clientDeviceId) === ws) {
+                browsers.delete(clientDeviceId);
+                console.log(`[WS] Android device disconnected: ${clientDeviceId}`);
+                addLog(null, 'Android Uygulaması', clientDeviceId, 'Cihaz Ayrıldı', 'info', 'Cihaz bağlantıyı kapattı.');
+            } else {
+                console.log(`[WS] Stale closed socket cleaned up for device: ${clientDeviceId} (active socket preserved)`);
+            }
         }
     });
 
     ws.on('error', (err) => {
-        console.error(`[WS] Connection error:`, err);
+        console.error(`[WS] Connection error for ${clientDeviceId || 'unknown'}:`, err);
     });
 });
+
+// Server-side keepalive ping every 15s to keep proxy connections active
+setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.readyState === 1) { // 1 = OPEN
+            try {
+                ws.ping();
+            } catch (e) {}
+        }
+    });
+}, 15000);
 
 // ----------------------------------------------------
 // 1. STANDARD MCP SSE TRANSPORT ENDPOINTS
