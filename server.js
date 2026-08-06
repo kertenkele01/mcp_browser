@@ -206,52 +206,49 @@ const TOOLS = [
     }
 ];
 
-// Helper to find connected browser with sticky session-to-device binding & inactivity timeout
-function getBrowserWsForSession(sessionId, requestedDeviceId) {
-    const sseSess = sseSessions.get(sessionId);
-    const now = Date.now();
-    const BINDING_TIMEOUT_MS = 2 * 60 * 1000; // 2 dakikalık inaktivite zaman aşımı
+// Helper to find connected browser with sticky session-to-device binding
+const sessionDeviceBindings = new Map(); // sessionId -> { boundDeviceId, lastToolCallTime }
 
-    // Eğer AI 2 dakika boyunca tool çağırmadıysa cihaz eşleşmesini otomatik sıfırla
-    if (sseSess && sseSess.boundDeviceId && sseSess.lastToolCallTime) {
-        if (now - sseSess.lastToolCallTime > BINDING_TIMEOUT_MS) {
-            console.log(`[MCP] Oturum '${sessionId}' 2 dakikadır işlem yapmadı. Bağlı cihaz ('${sseSess.boundDeviceId}') eşleşmesi sıfırlandı.`);
-            delete sseSess.boundDeviceId;
-        }
+function getBrowserWsForSession(sessionId = 'default_session', requestedDeviceId = null) {
+    const now = Date.now();
+    const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 dakikalık inaktivite zaman aşımı
+
+    let binding = sessionDeviceBindings.get(sessionId);
+
+    // İnaktivite süresi dolduysa eşleşmeyi temizle
+    if (binding && (now - binding.lastToolCallTime > INACTIVITY_TIMEOUT_MS)) {
+        console.log(`[MCP] Oturum '${sessionId}' için cihaz eşleşmesi ('${binding.boundDeviceId}') 30 dk inaktivite sonrası sıfırlandı.`);
+        sessionDeviceBindings.delete(sessionId);
+        binding = null;
     }
 
-    // 1. AI açıkça belirli bir deviceId talep ettiyse onu kullan ve eşleştir
+    // 1. AI açıkça online olan geçerli bir deviceId talep ettiyse onu kullan ve eşleştir
     if (requestedDeviceId && browsers.has(requestedDeviceId)) {
         const ws = browsers.get(requestedDeviceId);
         if (ws && ws.readyState === 1) { // 1 = OPEN
-            if (sseSess) {
-                sseSess.boundDeviceId = requestedDeviceId;
-                sseSess.lastToolCallTime = now;
-            }
+            sessionDeviceBindings.set(sessionId, { boundDeviceId: requestedDeviceId, lastToolCallTime: now });
             return { ws, deviceId: requestedDeviceId };
         }
         browsers.delete(requestedDeviceId);
     }
 
-    // 2. Bu oturumun aktif ve hâlâ online olan bir cihaz eşleşmesi var mı kontrol et
-    if (sseSess && sseSess.boundDeviceId && browsers.has(sseSess.boundDeviceId)) {
-        const boundWs = browsers.get(sseSess.boundDeviceId);
+    // 2. Bu oturumun aktif ve hâlâ online olan sabit (sticky) bir bağlı cihazı var mı kontrol et
+    if (binding && binding.boundDeviceId && browsers.has(binding.boundDeviceId)) {
+        const boundWs = browsers.get(binding.boundDeviceId);
         if (boundWs && boundWs.readyState === 1) {
-            sseSess.lastToolCallTime = now;
-            return { ws: boundWs, deviceId: sseSess.boundDeviceId };
+            binding.lastToolCallTime = now;
+            return { ws: boundWs, deviceId: binding.boundDeviceId };
         }
-        console.log(`[MCP] Bağlı cihaz '${sseSess.boundDeviceId}' koptu. '${sessionId}' oturumuna yeni bir cihaz atanacak.`);
-        delete sseSess.boundDeviceId;
+        console.log(`[MCP] Bağlı cihaz '${binding.boundDeviceId}' koptu. '${sessionId}' oturumuna yeni cihaz atanacak.`);
+        sessionDeviceBindings.delete(sessionId);
     }
 
-    // 3. Varsayılan: Bağlı ilk aktif Android cihazı seç ve bu oturuma eşle
+    // 3. AI eski/offline bir deviceId istedi veya oturum henüz bir cihaza bağlı değil:
+    // Bağlı ilk aktif Android cihazını seç ve bu oturuma sabitle!
     for (const [id, ws] of browsers.entries()) {
         if (ws && ws.readyState === 1) {
-            if (sseSess) {
-                sseSess.boundDeviceId = id;
-                sseSess.lastToolCallTime = now;
-                console.log(`[MCP] Oturum '${sessionId}' için Android cihazı eşleştirildi: '${id}'`);
-            }
+            sessionDeviceBindings.set(sessionId, { boundDeviceId: id, lastToolCallTime: now });
+            console.log(`[MCP] Oturum '${sessionId}' için aktif Android cihazı eşleştirildi: '${id}'`);
             return { ws, deviceId: id };
         } else {
             browsers.delete(id);
@@ -565,7 +562,8 @@ app.post('/message', async (req, res) => {
         const clientName = session ? (session.clientInfo ? session.clientInfo.name : 'MCP İstemcisi') : 'MCP İstemcisi';
 
         try {
-            addLog(sessionId, clientName, deviceId || 'Varsayılan Cihaz', `Araç Çağrısı: ${toolName}`, 'pending', `Komut gönderiliyor. Parametreler: ${JSON.stringify(cleanArgs)}`);
+            const { deviceId: resolvedDeviceId } = getBrowserWsForSession(sessionId, deviceId);
+            addLog(sessionId, clientName, resolvedDeviceId || deviceId || 'Varsayılan Cihaz', `Araç Çağrısı: ${toolName}`, 'pending', `Komut gönderiliyor. Parametreler: ${JSON.stringify(cleanArgs)}`);
             let responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId, sessionId, clientName);
             
             // Preserve our custom JS engine's Markdown output before Crawl4AI processing
