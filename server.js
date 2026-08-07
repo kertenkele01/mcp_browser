@@ -644,7 +644,7 @@ function extractMarkdownFromCrawlResponse(obj) {
     if (typeof obj !== 'object') return null;
 
     // 1. Direct priority keys
-    const priorityKeys = ['markdown', 'fit_markdown', 'raw_markdown', 'citations_markdown', 'content_markdown'];
+    const priorityKeys = ['raw_markdown', 'markdown', 'fit_markdown', 'citations_markdown', 'content_markdown'];
     for (const key of priorityKeys) {
         if (obj[key]) {
             const sub = extractMarkdownFromCrawlResponse(obj[key]);
