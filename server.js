@@ -731,10 +731,18 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, se
                     crawlHeaders['X-API-Key'] = cleanToken;
                 }
 
+                const pageUrl = (responseData.url && typeof responseData.url === 'string' && responseData.url.trim().length > 0)
+                    ? responseData.url.trim()
+                    : 'https://browser.page';
+
                 const requestBody = {
-                    url: responseData.url || '',
+                    urls: [pageUrl],
+                    url: pageUrl,
                     html: fullRawHtml,
-                    word_count_threshold: 10
+                    raw_html: fullRawHtml,
+                    word_count_threshold: 10,
+                    api_key: cleanToken,
+                    token: cleanToken
                 };
 
                 const crawlRes = await fetch(targetUrl, {
