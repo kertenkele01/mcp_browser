@@ -630,6 +630,58 @@ app.post('/message', async (req, res) => {
     return res.status(200).send("accepted");
 });
 
+function extractMarkdownFromCrawlResponse(obj) {
+    if (!obj) return null;
+    
+    if (typeof obj === 'string') {
+        const trimmed = obj.trim();
+        if (trimmed && trimmed !== "None" && !trimmed.startsWith('<!DOCTYPE') && !trimmed.startsWith('<html')) {
+            return trimmed;
+        }
+        return null;
+    }
+
+    if (typeof obj !== 'object') return null;
+
+    // 1. Direct priority keys
+    const priorityKeys = ['markdown', 'fit_markdown', 'raw_markdown', 'citations_markdown', 'content_markdown'];
+    for (const key of priorityKeys) {
+        if (obj[key]) {
+            const sub = extractMarkdownFromCrawlResponse(obj[key]);
+            if (sub) return sub;
+        }
+    }
+
+    // 2. Look inside 'results', 'result', 'data', 'items' arrays or objects
+    const containers = ['results', 'result', 'data', 'items'];
+    for (const containerKey of containers) {
+        const val = obj[containerKey];
+        if (Array.isArray(val) && val.length > 0) {
+            for (const item of val) {
+                const sub = extractMarkdownFromCrawlResponse(item);
+                if (sub) return sub;
+            }
+        } else if (val && typeof val === 'object') {
+            const sub = extractMarkdownFromCrawlResponse(val);
+            if (sub) return sub;
+        } else if (typeof val === 'string') {
+            const sub = extractMarkdownFromCrawlResponse(val);
+            if (sub) return sub;
+        }
+    }
+
+    // 3. Look at generic string keys
+    const textKeys = ['content', 'text', 'cleaned_html', 'md'];
+    for (const key of textKeys) {
+        if (obj[key]) {
+            const sub = extractMarkdownFromCrawlResponse(obj[key]);
+            if (sub) return sub;
+        }
+    }
+
+    return null;
+}
+
 async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, sessionId = null, clientName = null, deviceId = null) {
     if (!responseData) return responseData;
 
@@ -679,18 +731,10 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, se
                     crawlHeaders['X-API-Key'] = cleanToken;
                 }
 
-                const pageUrl = (responseData.url && typeof responseData.url === 'string' && responseData.url.trim().length > 0)
-                    ? responseData.url.trim()
-                    : 'https://browser.page';
-
                 const requestBody = {
-                    urls: [pageUrl],
-                    url: pageUrl,
+                    url: responseData.url || '',
                     html: fullRawHtml,
-                    raw_html: fullRawHtml,
-                    word_count_threshold: 10,
-                    api_key: cleanToken,
-                    token: cleanToken
+                    word_count_threshold: 10
                 };
 
                 const crawlRes = await fetch(targetUrl, {
@@ -704,21 +748,19 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, se
 
                 if (crawlRes.ok) {
                     const crawlJson = await crawlRes.json();
-                    if (crawlJson && (crawlJson.markdown || crawlJson.result || crawlJson.fit_markdown)) {
-                        const authenticMarkdown = crawlJson.markdown || crawlJson.result || crawlJson.fit_markdown;
-                        if (authenticMarkdown && authenticMarkdown !== "None" && authenticMarkdown.trim().length > 0) {
-                            console.log(`[Crawl4AI] SUCCESS: Received official Crawl4AI markdown (${authenticMarkdown.length} chars)!`);
-                            convertedMarkdown = authenticMarkdown;
-                            responseData.engine_used = "Official Crawl4AI Python Engine";
-                            responseData.markdown_status = "SUCCESS (Official Crawl4AI Python Engine)";
-                            addLog(sessionId, clientName, deviceId, 'Crawl4AI Başarılı', 'success', `Official Crawl4AI Python Engine ile ${authenticMarkdown.length} karakter markdown üretildi.`);
-                        } else {
-                            console.warn(`[Crawl4AI] WARNING: Crawl4AI returned OK but markdown content was empty.`);
-                            crawlError = "Crawl4AI returned OK but empty content.";
-                        }
+                    const authenticMarkdown = extractMarkdownFromCrawlResponse(crawlJson);
+                    
+                    if (authenticMarkdown && authenticMarkdown.length > 0) {
+                        console.log(`[Crawl4AI] SUCCESS: Received official Crawl4AI markdown (${authenticMarkdown.length} chars)!`);
+                        convertedMarkdown = authenticMarkdown;
+                        responseData.engine_used = "Official Crawl4AI Python Engine";
+                        responseData.markdown_status = "SUCCESS (Official Crawl4AI Python Engine)";
+                        addLog(sessionId, clientName, deviceId, 'Crawl4AI Başarılı', 'success', `Official Crawl4AI Python Engine ile ${authenticMarkdown.length} karakter markdown üretildi.`);
                     } else {
-                        console.warn(`[Crawl4AI] WARNING: Crawl4AI response missing 'markdown' field:`, JSON.stringify(crawlJson).substring(0, 300));
-                        crawlError = "Crawl4AI response missing 'markdown' field.";
+                        const jsonSnippet = JSON.stringify(crawlJson).substring(0, 200);
+                        console.warn(`[Crawl4AI] WARNING: Could not parse markdown from Crawl4AI response: ${jsonSnippet}`);
+                        crawlError = `Crawl4AI response body format not recognized: ${jsonSnippet}`;
+                        addLog(sessionId, clientName, deviceId, 'Crawl4AI Yanıt Format Hatası', 'error', `Yanıt 200 OK döndü ancak Markdown çıkarılamadı: ${jsonSnippet}`);
                     }
                 } else {
                     const errText = await crawlRes.text().catch(() => '');
