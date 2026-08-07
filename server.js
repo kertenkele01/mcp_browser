@@ -621,7 +621,8 @@ app.post('/message', async (req, res) => {
                             }
                         }
                     } else {
-                        console.warn(`[Crawl4AI] Service returned HTTP ${crawlRes.status}`);
+                        const errText = await crawlRes.text().catch(() => '');
+                        console.warn(`[Crawl4AI] Service returned HTTP ${crawlRes.status}: ${errText}`);
                     }
                 } catch (c4err) {
                     console.error(`[Crawl4AI] Python Service call skipped or failed: ${c4err.message}`);
