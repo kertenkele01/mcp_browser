@@ -566,74 +566,13 @@ app.post('/message', async (req, res) => {
             const { deviceId: resolvedDeviceId } = getBrowserWsForSession(sessionId, deviceId);
             addLog(sessionId, clientName, resolvedDeviceId || deviceId || 'Varsayılan Cihaz', `Araç Çağrısı: ${toolName}`, 'pending', `Komut gönderiliyor. Parametreler: ${JSON.stringify(cleanArgs)}`);
             let responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId, sessionId, clientName);
-            
-            // Preserve our custom JS engine's Markdown output before Crawl4AI processing
-            if (responseData && (responseData.markdown || responseData.turndown_markdown)) {
-                responseData.custom_markdown = responseData.markdown || responseData.turndown_markdown;
-            }
-
-            // Ensure browser_get_html also includes our custom_markdown clearly
-            if (toolName === "browser_get_html" && responseData && !responseData.custom_markdown) {
-                responseData.custom_markdown = responseData.turndown_markdown || responseData.markdown || "";
-            }
-
-            // If real Crawl4AI API service is configured, process full raw HTML through official Crawl4AI Python Engine!
-            if ((toolName === "browser_get_markdown" || toolName === "browser_get_html") && process.env.CRAWL4AI_API_URL && responseData && (responseData.html || responseData.raw_html || responseData.url)) {
-                try {
-                    const fullRawHtml = responseData.raw_html || responseData.html || '';
-                    console.log(`[Crawl4AI] Forwarding complete raw page HTML (${fullRawHtml.length} chars) to Crawl4AI Engine: ${process.env.CRAWL4AI_API_URL}`);
-                    
-                    const crawlHeaders = { 
-                        'Content-Type': 'application/json',
-                        'Bypass-Tunnel-Reminder': 'true',
-                        'User-Agent': 'MCP-Server/1.0'
-                    };
-
-                    const crawlToken = process.env.CRAWL4AI_API_TOKEN || process.env.CRAWL4AI_TOKEN || req.headers['x-crawl4ai-token'];
-                    if (crawlToken) {
-                        const cleanToken = crawlToken.trim().replace(/^Bearer\s+/i, '');
-                        crawlHeaders['Authorization'] = `Bearer ${cleanToken}`;
-                    }
-
-                    const crawlRes = await fetch(process.env.CRAWL4AI_API_URL, {
-                        method: 'POST',
-                        headers: crawlHeaders,
-                        signal: AbortSignal.timeout(15000), // 15 seconds max timeout for complete page processing
-                        body: JSON.stringify({
-                            url: responseData.url || '',
-                            html: fullRawHtml,
-                            word_count_threshold: 10
-                        })
-                    });
-
-                    if (crawlRes.ok) {
-                        const crawlJson = await crawlRes.json();
-                        if (crawlJson && (crawlJson.markdown || crawlJson.result)) {
-                            const authenticMarkdown = crawlJson.markdown || crawlJson.result;
-                            if (authenticMarkdown && authenticMarkdown !== "None" && authenticMarkdown.trim().length > 0) {
-                                console.log(`[Crawl4AI] Successfully received official Crawl4AI markdown (${authenticMarkdown.length} chars)!`);
-                                responseData.markdown = authenticMarkdown;
-                                responseData.crawl4ai_markdown = authenticMarkdown;
-                                responseData.engine_used = "Official Crawl4AI Python Engine";
-                                if (crawlJson.fit_markdown && crawlJson.fit_markdown !== "None") responseData.fit_markdown = crawlJson.fit_markdown;
-                                if (crawlJson.raw_markdown && crawlJson.raw_markdown !== "None") responseData.raw_markdown = crawlJson.raw_markdown;
-                                if (crawlJson.citations_markdown && crawlJson.citations_markdown !== "None") responseData.citations_markdown = crawlJson.citations_markdown;
-                            }
-                        }
-                    } else {
-                        const errText = await crawlRes.text().catch(() => '');
-                        console.warn(`[Crawl4AI] Service returned HTTP ${crawlRes.status}: ${errText}`);
-                    }
-                } catch (c4err) {
-                    console.error(`[Crawl4AI] Python Service call skipped or failed: ${c4err.message}`);
-                }
-            }
+            responseData = await processCrawl4AIEngine(toolName, responseData, req.headers);
 
             let details = "Komut başarıyla yürütüldü.";
-            if (toolName === "browser_get_markdown" && responseData.markdown) {
-                details = `Markdown verisi başarıyla alındı. (${responseData.markdown.length} karakter)`;
-            } else if (toolName === "browser_get_html" && responseData.html) {
-                details = `Saf HTML kaynağı başarıyla alındı. (${responseData.html.length} karakter)`;
+            if ((toolName === "browser_get_markdown" || toolName === "get_markdown") && responseData.markdown) {
+                details = `[Motor: ${responseData.engine_used}] Markdown verisi alındı (${responseData.markdown.length} karakter).`;
+            } else if ((toolName === "browser_get_html" || toolName === "get_html") && responseData.html) {
+                details = `[Motor: ${responseData.engine_used}] HTML kaynağı ve Markdown alındı (${responseData.html.length} karakter).`;
             } else if (toolName === "browser_navigate" && responseData.url) {
                 details = `Adrese yönlendirildi: ${responseData.url}`;
             } else if (toolName === "browser_search" && responseData.url) {
@@ -691,6 +630,94 @@ app.post('/message', async (req, res) => {
     return res.status(200).send("accepted");
 });
 
+async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}) {
+    if (!responseData) return responseData;
+
+    const isMarkdownTool = (toolName === "browser_get_markdown" || toolName === "browser_get_html" || toolName === "get_markdown" || toolName === "get_html");
+
+    // Preserve custom JS engine's output
+    if (responseData.markdown || responseData.turndown_markdown) {
+        responseData.custom_markdown = responseData.markdown || responseData.turndown_markdown;
+    }
+
+    if (toolName === "browser_get_html" && !responseData.custom_markdown) {
+        responseData.custom_markdown = responseData.turndown_markdown || responseData.markdown || "";
+    }
+
+    let crawlError = null;
+
+    if (isMarkdownTool && process.env.CRAWL4AI_API_URL && (responseData.html || responseData.raw_html || responseData.url)) {
+        try {
+            const fullRawHtml = responseData.raw_html || responseData.html || '';
+            console.log(`[Crawl4AI] Forwarding complete raw page HTML (${fullRawHtml.length} chars) to Crawl4AI Engine: ${process.env.CRAWL4AI_API_URL}`);
+            
+            const crawlHeaders = { 
+                'Content-Type': 'application/json',
+                'Bypass-Tunnel-Reminder': 'true',
+                'User-Agent': 'MCP-Server/1.0'
+            };
+
+            const crawlToken = process.env.CRAWL4AI_API_TOKEN || process.env.CRAWL4AI_TOKEN || (reqHeaders && reqHeaders['x-crawl4ai-token']);
+            if (crawlToken) {
+                const cleanToken = crawlToken.trim().replace(/^Bearer\s+/i, '');
+                crawlHeaders['Authorization'] = `Bearer ${cleanToken}`;
+            }
+
+            const crawlRes = await fetch(process.env.CRAWL4AI_API_URL, {
+                method: 'POST',
+                headers: crawlHeaders,
+                signal: AbortSignal.timeout(15000), // 15 seconds max timeout
+                body: JSON.stringify({
+                    url: responseData.url || '',
+                    html: fullRawHtml,
+                    word_count_threshold: 10
+                })
+            });
+
+            if (crawlRes.ok) {
+                const crawlJson = await crawlRes.json();
+                if (crawlJson && (crawlJson.markdown || crawlJson.result)) {
+                    const authenticMarkdown = crawlJson.markdown || crawlJson.result;
+                    if (authenticMarkdown && authenticMarkdown !== "None" && authenticMarkdown.trim().length > 0) {
+                        console.log(`[Crawl4AI] Successfully received official Crawl4AI markdown (${authenticMarkdown.length} chars)!`);
+                        responseData.markdown = authenticMarkdown;
+                        responseData.crawl4ai_markdown = authenticMarkdown;
+                        responseData.engine_used = "Official Crawl4AI Python Engine";
+                        responseData.markdown_conversion_status = "SUCCESS (Official Crawl4AI Python Engine)";
+                        if (crawlJson.fit_markdown && crawlJson.fit_markdown !== "None") responseData.fit_markdown = crawlJson.fit_markdown;
+                        if (crawlJson.raw_markdown && crawlJson.raw_markdown !== "None") responseData.raw_markdown = crawlJson.raw_markdown;
+                        if (crawlJson.citations_markdown && crawlJson.citations_markdown !== "None") responseData.citations_markdown = crawlJson.citations_markdown;
+                    }
+                }
+            } else {
+                const errText = await crawlRes.text().catch(() => '');
+                console.warn(`[Crawl4AI] Service returned HTTP ${crawlRes.status}: ${errText}`);
+                crawlError = `HTTP ${crawlRes.status}: ${errText}`;
+            }
+        } catch (c4err) {
+            console.error(`[Crawl4AI] Python Service call skipped or failed: ${c4err.message}`);
+            crawlError = c4err.message;
+        }
+    }
+
+    if (isMarkdownTool && !responseData.engine_used) {
+        responseData.engine_used = "Built-in Turndown JS Engine (Local Fallback)";
+        if (crawlError) {
+            responseData.markdown_conversion_status = `FALLBACK: Local Turndown JS Engine (Crawl4AI Error: ${crawlError})`;
+        } else if (!process.env.CRAWL4AI_API_URL) {
+            responseData.markdown_conversion_status = "FALLBACK: Local Turndown JS Engine (CRAWL4AI_API_URL not set)";
+        } else {
+            responseData.markdown_conversion_status = "FALLBACK: Local Turndown JS Engine (Crawl4AI returned empty response)";
+        }
+    }
+
+    if (responseData.engine_used) {
+        responseData.converter_info = `[MARKDOWN ENGINE]: ${responseData.engine_used} | Status: ${responseData.markdown_conversion_status || 'OK'}`;
+    }
+
+    return responseData;
+}
+
 // ----------------------------------------------------
 // 2. DIRECT REST FALLBACK API ENDPOINTS
 // ----------------------------------------------------
@@ -705,8 +732,9 @@ const directToolHandler = async (type, req, res) => {
 
     try {
         addLog(null, 'REST Fallback API', deviceId || 'Varsayılan Cihaz', `Direct API: ${type}`, 'pending', `Parametreler: ${JSON.stringify(cleanArgs)}`);
-        const responseData = await routeCommandToBrowser(type, cleanArgs, deviceId);
-        addLog(null, 'REST Fallback API', deviceId || 'Varsayılan Cihaz', `Direct API Başarılı: ${type}`, 'success', `Yanıt boyutu: ${JSON.stringify(responseData).length} karakter.`);
+        let responseData = await routeCommandToBrowser(type, cleanArgs, deviceId);
+        responseData = await processCrawl4AIEngine(type, responseData, req.headers);
+        addLog(null, 'REST Fallback API', deviceId || 'Varsayılan Cihaz', `Direct API Başarılı: ${type}`, 'success', `Yanıt boyutu: ${JSON.stringify(responseData).length} karakter. Motor: ${responseData.engine_used || 'varsayılan'}`);
         return res.json({ status: "success", data: responseData });
     } catch (error) {
         addLog(null, 'REST Fallback API', deviceId || 'Varsayılan Cihaz', `Direct API Hatası: ${type}`, 'error', error.message);
