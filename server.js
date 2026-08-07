@@ -72,7 +72,17 @@ const TOOLS = [
     },
     {
         name: "browser_get_html",
-        description: "Şu an açık olan sayfanın saf HTML kaynağını (`html`), dönüştürülmüş Markdown içeriğini (`markdown`) ve dönüştürücü motor bilgisini (`engine_used`) alır.",
+        description: "Şu an açık olan sayfanın saf HTML kaynağını (`html`), sayfa URL'sini ve sayfa başlığını alır.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            }
+        }
+    },
+    {
+        name: "browser_get_local_markdown",
+        description: "Şu an açık olan sayfanın yerel dahili dönüştürücüsü (Built-in Turndown JS Engine) ile dönüştürülmüş Markdown içeriğini (`markdown`) alır. Crawl4AI sunucusuna istek atmadan doğrudan yerel ve hızlı dönüşüm yapar.",
         inputSchema: {
             type: "object",
             properties: {
@@ -82,7 +92,7 @@ const TOOLS = [
     },
     {
         name: "browser_get_markdown",
-        description: "Şu an açık olan sayfanın temizlenmiş Markdown içeriğini (`markdown`), kullanılan dönüştürücü motoru (`engine_used`: 'Official Crawl4AI Python Engine' veya 'Built-in Turndown JS Engine') ve dönüştürme durumunu (`markdown_status`) alır.",
+        description: "Şu an açık olan sayfanın resmi Python Crawl4AI motoru ile işlenmiş fit_markdown/Markdown içeriğini (`markdown`), kullanılan motor bilgisini (`engine_used`) ve dönüştürme durumunu (`markdown_status`) alır.",
         inputSchema: {
             type: "object",
             properties: {
@@ -543,7 +553,9 @@ app.post('/message', async (req, res) => {
             case "browser_navigate": actionType = "navigate"; break;
             case "browser_search": actionType = "search"; break;
             case "browser_get_html": actionType = "get_html"; break;
-            case "browser_get_markdown": actionType = "get_markdown"; break;
+            case "browser_get_local_markdown": actionType = "get_local_markdown"; break;
+            case "browser_get_markdown": 
+            case "browser_get_crawl4ai_markdown": actionType = "get_markdown"; break;
             case "browser_scroll": actionType = "scroll"; break;
             case "browser_click": actionType = "click"; break;
             case "browser_type": actionType = "type"; break;
@@ -569,10 +581,12 @@ app.post('/message', async (req, res) => {
             responseData = await processCrawl4AIEngine(toolName, responseData, req.headers, sessionId, clientName, deviceId);
 
             let details = "Komut başarıyla yürütüldü.";
-            if ((toolName === "browser_get_markdown" || toolName === "get_markdown") && responseData.markdown) {
-                details = `[Motor: ${responseData.engine_used}] Markdown verisi alındı (${responseData.markdown.length} karakter).`;
+            if ((toolName === "browser_get_markdown" || toolName === "browser_get_crawl4ai_markdown" || toolName === "get_markdown") && responseData.markdown) {
+                details = `[Motor: ${responseData.engine_used}] Crawl4AI Markdown verisi alındı (${responseData.markdown.length} karakter).`;
+            } else if ((toolName === "browser_get_local_markdown" || toolName === "get_local_markdown") && responseData.markdown) {
+                details = `[Motor: ${responseData.engine_used}] Yerel Markdown verisi alındı (${responseData.markdown.length} karakter).`;
             } else if ((toolName === "browser_get_html" || toolName === "get_html") && responseData.html) {
-                details = `[Motor: ${responseData.engine_used}] HTML kaynağı ve Markdown alındı (${responseData.html.length} karakter).`;
+                details = `HTML kaynağı alındı (${responseData.html.length} karakter).`;
             } else if (toolName === "browser_navigate" && responseData.url) {
                 details = `Adrese yönlendirildi: ${responseData.url}`;
             } else if (toolName === "browser_search" && responseData.url) {
@@ -644,7 +658,7 @@ function extractMarkdownFromCrawlResponse(obj) {
     if (typeof obj !== 'object') return null;
 
     // 1. Direct priority keys
-    const priorityKeys = ['raw_markdown', 'markdown', 'fit_markdown', 'citations_markdown', 'content_markdown'];
+    const priorityKeys = ['fit_markdown', 'markdown', 'raw_markdown', 'citations_markdown', 'content_markdown'];
     for (const key of priorityKeys) {
         if (obj[key]) {
             const sub = extractMarkdownFromCrawlResponse(obj[key]);
@@ -685,17 +699,49 @@ function extractMarkdownFromCrawlResponse(obj) {
 async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, sessionId = null, clientName = null, deviceId = null) {
     if (!responseData) return responseData;
 
-    const isMarkdownTool = (toolName === "browser_get_markdown" || toolName === "browser_get_html" || toolName === "get_markdown" || toolName === "get_html");
-
     // Capture initial fallback markdown from Android local JS engine
     const fallbackMarkdown = responseData.markdown || responseData.turndown_markdown || responseData.custom_markdown || "";
+
+    // 1. LOCAL MARKDOWN TOOL (browser_get_local_markdown)
+    if (toolName === "browser_get_local_markdown" || toolName === "get_local_markdown") {
+        responseData.markdown = fallbackMarkdown;
+        responseData.engine_used = "Built-in Turndown JS Engine (Local)";
+        responseData.markdown_status = "SUCCESS (Built-in Turndown JS Engine)";
+
+        delete responseData.turndown_markdown;
+        delete responseData.custom_markdown;
+        delete responseData.crawl4ai_markdown;
+        delete responseData.fit_markdown;
+        delete responseData.raw_markdown;
+        delete responseData.html;
+        delete responseData.raw_html;
+
+        return responseData;
+    }
+
+    // 2. HTML TOOL (browser_get_html)
+    if (toolName === "browser_get_html" || toolName === "get_html") {
+        responseData.markdown = fallbackMarkdown;
+        responseData.engine_used = "Built-in Turndown JS Engine (Local)";
+        delete responseData.turndown_markdown;
+        delete responseData.custom_markdown;
+        delete responseData.crawl4ai_markdown;
+        delete responseData.fit_markdown;
+        delete responseData.raw_markdown;
+        delete responseData.raw_html;
+
+        return responseData;
+    }
+
+    // 3. CRAWL4AI MARKDOWN TOOL (browser_get_markdown / browser_get_crawl4ai_markdown)
+    const isCrawlTool = (toolName === "browser_get_markdown" || toolName === "browser_get_crawl4ai_markdown" || toolName === "get_markdown");
 
     let crawlError = null;
     let convertedMarkdown = null;
 
     const targetUrl = (process.env.CRAWL4AI_API_URL || '').trim();
 
-    if (isMarkdownTool) {
+    if (isCrawlTool) {
         if (!targetUrl) {
             console.log(`[Crawl4AI] CRAWL4AI_API_URL is NOT configured in environment. Using local Turndown JS fallback engine.`);
         } else if (responseData.html || responseData.raw_html || responseData.url) {
@@ -789,7 +835,7 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, se
         responseData.markdown = convertedMarkdown;
     } else {
         responseData.markdown = fallbackMarkdown;
-        if (isMarkdownTool) {
+        if (isCrawlTool) {
             responseData.engine_used = "Built-in Turndown JS Engine (Local Fallback)";
             if (crawlError) {
                 responseData.markdown_status = `FALLBACK: Built-in Turndown JS Engine (Crawl4AI Error: ${crawlError})`;
@@ -809,7 +855,7 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, se
     delete responseData.raw_markdown;
     delete responseData.raw_html;
 
-    if (toolName === "browser_get_markdown" || toolName === "get_markdown") {
+    if (isCrawlTool) {
         delete responseData.html;
     }
 
@@ -851,8 +897,13 @@ const fallbackRoutes = [
     { path: '/mcp/tools/browser_get_html', type: 'get_html' },
     { path: '/tools/browser_get_html', type: 'get_html' },
     
+    { path: '/mcp/tools/browser_get_local_markdown', type: 'get_local_markdown' },
+    { path: '/tools/browser_get_local_markdown', type: 'get_local_markdown' },
+    
     { path: '/mcp/tools/browser_get_markdown', type: 'get_markdown' },
     { path: '/tools/browser_get_markdown', type: 'get_markdown' },
+    { path: '/mcp/tools/browser_get_crawl4ai_markdown', type: 'get_markdown' },
+    { path: '/tools/browser_get_crawl4ai_markdown', type: 'get_markdown' },
     
     { path: '/mcp/tools/browser_scroll', type: 'scroll' },
     { path: '/tools/browser_scroll', type: 'scroll' },
