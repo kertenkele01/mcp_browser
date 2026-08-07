@@ -4,7 +4,8 @@ const { WebSocketServer } = require('ws');
 const { randomUUID } = require('crypto');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // CORS Support
 app.use((req, res, next) => {
@@ -576,23 +577,32 @@ app.post('/message', async (req, res) => {
                 responseData.custom_markdown = responseData.turndown_markdown || responseData.markdown || "";
             }
 
-            // If real Crawl4AI API service is configured, process HTML through official Crawl4AI Python Engine!
-            if (toolName === "browser_get_markdown" && process.env.CRAWL4AI_API_URL && (responseData.html || responseData.url)) {
+            // If real Crawl4AI API service is configured, process full raw HTML through official Crawl4AI Python Engine!
+            if ((toolName === "browser_get_markdown" || toolName === "browser_get_html") && process.env.CRAWL4AI_API_URL && responseData && (responseData.html || responseData.raw_html || responseData.url)) {
                 try {
-                    console.log(`[Crawl4AI] Forwarding page HTML/URL to Crawl4AI Engine: ${process.env.CRAWL4AI_API_URL}`);
+                    const fullRawHtml = responseData.raw_html || responseData.html || '';
+                    console.log(`[Crawl4AI] Forwarding complete raw page HTML (${fullRawHtml.length} chars) to Crawl4AI Engine: ${process.env.CRAWL4AI_API_URL}`);
+                    
+                    const crawlHeaders = { 
+                        'Content-Type': 'application/json',
+                        'Bypass-Tunnel-Reminder': 'true',
+                        'User-Agent': 'MCP-Server/1.0'
+                    };
+
+                    const crawlToken = process.env.CRAWL4AI_API_TOKEN || process.env.CRAWL4AI_TOKEN || req.headers['x-crawl4ai-token'];
+                    if (crawlToken) {
+                        const cleanToken = crawlToken.trim().replace(/^Bearer\s+/i, '');
+                        crawlHeaders['Authorization'] = `Bearer ${cleanToken}`;
+                    }
+
                     const crawlRes = await fetch(process.env.CRAWL4AI_API_URL, {
                         method: 'POST',
-                        headers: { 
-                            'Content-Type': 'application/json',
-                            'Bypass-Tunnel-Reminder': 'true',
-                            'User-Agent': 'MCP-Server/1.0'
-                        },
-                        signal: AbortSignal.timeout(12000), // 12 seconds max timeout to avoid hanging MCP tool calls
+                        headers: crawlHeaders,
+                        signal: AbortSignal.timeout(15000), // 15 seconds max timeout for complete page processing
                         body: JSON.stringify({
                             url: responseData.url || '',
-                            html: responseData.html || '',
-                            word_count_threshold: 10,
-                            css_selector: 'body'
+                            html: fullRawHtml,
+                            word_count_threshold: 10
                         })
                     });
 
