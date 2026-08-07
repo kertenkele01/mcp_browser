@@ -72,7 +72,7 @@ const TOOLS = [
     },
     {
         name: "browser_get_html",
-        description: "Şu an açık olan sayfanın saf HTML kaynağını (`html`) ve eski/özel JS Markdown dönüştürücümüzün interaktif ID tablolu çıktısını (`custom_markdown` / `turndown_markdown`) alır.",
+        description: "Şu an açık olan sayfanın saf HTML kaynağını (`html`), dönüştürülmüş Markdown içeriğini (`markdown`) ve dönüştürücü motor bilgisini (`engine_used`) alır.",
         inputSchema: {
             type: "object",
             properties: {
@@ -82,7 +82,7 @@ const TOOLS = [
     },
     {
         name: "browser_get_markdown",
-        description: "Şu an açık olan sayfanın Crawl4AI Python motoru üretimi Markdown içeriğini (`markdown` / `crawl4ai_markdown`) ve eski/özel JS dönüştürücümüzün çıktısını (`custom_markdown`) alır.",
+        description: "Şu an açık olan sayfanın temizlenmiş Markdown içeriğini (`markdown`), kullanılan dönüştürücü motoru (`engine_used`: 'Official Crawl4AI Python Engine' veya 'Built-in Turndown JS Engine') ve dönüştürme durumunu (`markdown_status`) alır.",
         inputSchema: {
             type: "object",
             properties: {
@@ -635,16 +635,11 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}) {
 
     const isMarkdownTool = (toolName === "browser_get_markdown" || toolName === "browser_get_html" || toolName === "get_markdown" || toolName === "get_html");
 
-    // Preserve custom JS engine's output
-    if (responseData.markdown || responseData.turndown_markdown) {
-        responseData.custom_markdown = responseData.markdown || responseData.turndown_markdown;
-    }
-
-    if (toolName === "browser_get_html" && !responseData.custom_markdown) {
-        responseData.custom_markdown = responseData.turndown_markdown || responseData.markdown || "";
-    }
+    // Capture initial fallback markdown from Android local JS engine
+    const fallbackMarkdown = responseData.markdown || responseData.turndown_markdown || responseData.custom_markdown || "";
 
     let crawlError = null;
+    let convertedMarkdown = null;
 
     if (isMarkdownTool && process.env.CRAWL4AI_API_URL && (responseData.html || responseData.raw_html || responseData.url)) {
         try {
@@ -657,10 +652,15 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}) {
                 'User-Agent': 'MCP-Server/1.0'
             };
 
-            const crawlToken = process.env.CRAWL4AI_API_TOKEN || process.env.CRAWL4AI_TOKEN || (reqHeaders && reqHeaders['x-crawl4ai-token']);
+            // Look for token across environment variables or incoming MCP headers
+            const incomingAuth = reqHeaders ? (reqHeaders['authorization'] || reqHeaders['Authorization'] || reqHeaders['x-crawl4ai-token'] || reqHeaders['x-api-key']) : null;
+            const crawlToken = process.env.CRAWL4AI_API_TOKEN || process.env.CRAWL4AI_TOKEN || incomingAuth;
+            
+            let cleanToken = "";
             if (crawlToken) {
-                const cleanToken = crawlToken.trim().replace(/^Bearer\s+/i, '');
+                cleanToken = crawlToken.trim().replace(/^Bearer\s+/i, '');
                 crawlHeaders['Authorization'] = `Bearer ${cleanToken}`;
+                crawlHeaders['X-API-Key'] = cleanToken;
             }
 
             const crawlRes = await fetch(process.env.CRAWL4AI_API_URL, {
@@ -670,7 +670,9 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}) {
                 body: JSON.stringify({
                     url: responseData.url || '',
                     html: fullRawHtml,
-                    word_count_threshold: 10
+                    word_count_threshold: 10,
+                    api_key: cleanToken,
+                    token: cleanToken
                 })
             });
 
@@ -680,13 +682,9 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}) {
                     const authenticMarkdown = crawlJson.markdown || crawlJson.result;
                     if (authenticMarkdown && authenticMarkdown !== "None" && authenticMarkdown.trim().length > 0) {
                         console.log(`[Crawl4AI] Successfully received official Crawl4AI markdown (${authenticMarkdown.length} chars)!`);
-                        responseData.markdown = authenticMarkdown;
-                        responseData.crawl4ai_markdown = authenticMarkdown;
+                        convertedMarkdown = authenticMarkdown;
                         responseData.engine_used = "Official Crawl4AI Python Engine";
-                        responseData.markdown_conversion_status = "SUCCESS (Official Crawl4AI Python Engine)";
-                        if (crawlJson.fit_markdown && crawlJson.fit_markdown !== "None") responseData.fit_markdown = crawlJson.fit_markdown;
-                        if (crawlJson.raw_markdown && crawlJson.raw_markdown !== "None") responseData.raw_markdown = crawlJson.raw_markdown;
-                        if (crawlJson.citations_markdown && crawlJson.citations_markdown !== "None") responseData.citations_markdown = crawlJson.citations_markdown;
+                        responseData.markdown_status = "SUCCESS (Official Crawl4AI Python Engine)";
                     }
                 }
             } else {
@@ -700,19 +698,33 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}) {
         }
     }
 
-    if (isMarkdownTool && !responseData.engine_used) {
-        responseData.engine_used = "Built-in Turndown JS Engine (Local Fallback)";
-        if (crawlError) {
-            responseData.markdown_conversion_status = `FALLBACK: Local Turndown JS Engine (Crawl4AI Error: ${crawlError})`;
-        } else if (!process.env.CRAWL4AI_API_URL) {
-            responseData.markdown_conversion_status = "FALLBACK: Local Turndown JS Engine (CRAWL4AI_API_URL not set)";
-        } else {
-            responseData.markdown_conversion_status = "FALLBACK: Local Turndown JS Engine (Crawl4AI returned empty response)";
+    // Set single primary markdown field & status information
+    if (convertedMarkdown) {
+        responseData.markdown = convertedMarkdown;
+    } else {
+        responseData.markdown = fallbackMarkdown;
+        if (isMarkdownTool) {
+            responseData.engine_used = "Built-in Turndown JS Engine (Local Fallback)";
+            if (crawlError) {
+                responseData.markdown_status = `FALLBACK: Built-in Turndown JS Engine (Crawl4AI Error: ${crawlError})`;
+            } else if (!process.env.CRAWL4AI_API_URL) {
+                responseData.markdown_status = "FALLBACK: Built-in Turndown JS Engine (CRAWL4AI_API_URL not set)";
+            } else {
+                responseData.markdown_status = "FALLBACK: Built-in Turndown JS Engine (Crawl4AI returned empty response)";
+            }
         }
     }
 
-    if (responseData.engine_used) {
-        responseData.converter_info = `[MARKDOWN ENGINE]: ${responseData.engine_used} | Status: ${responseData.markdown_conversion_status || 'OK'}`;
+    // CLEANUP: Remove duplicate and redundant fields to avoid confusion for AI client
+    delete responseData.turndown_markdown;
+    delete responseData.custom_markdown;
+    delete responseData.crawl4ai_markdown;
+    delete responseData.fit_markdown;
+    delete responseData.raw_markdown;
+    delete responseData.raw_html;
+
+    if (toolName === "browser_get_markdown" || toolName === "get_markdown") {
+        delete responseData.html;
     }
 
     return responseData;
