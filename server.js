@@ -834,8 +834,10 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, se
     if (convertedMarkdown) {
         responseData.markdown = convertedMarkdown;
     } else {
-        responseData.markdown = fallbackMarkdown;
         if (isCrawlTool) {
+            /* 
+            // YEDEK/FALLBACK MEKANİZMASI (Pasife alındı)
+            responseData.markdown = fallbackMarkdown;
             responseData.engine_used = "Built-in Turndown JS Engine (Local Fallback)";
             if (crawlError) {
                 responseData.markdown_status = `FALLBACK: Built-in Turndown JS Engine (Crawl4AI Error: ${crawlError})`;
@@ -844,6 +846,12 @@ async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, se
             } else {
                 responseData.markdown_status = "FALLBACK: Built-in Turndown JS Engine (Crawl4AI returned empty response)";
             }
+            */
+            responseData.markdown = `Crawl4AI bağlantı başarısız oldu veya dönüşüm yapılamadı.\n\nHata detayı: ${crawlError || 'CRAWL4AI_API_URL eksik veya geçersiz.'}\n\nLütfen yerel çevirimi kullanmak için 'browser_get_local_markdown' aracını çağırın.`;
+            responseData.engine_used = "Crawl4AI Python Engine (FAILED)";
+            responseData.markdown_status = "FAILED";
+        } else {
+            responseData.markdown = fallbackMarkdown;
         }
     }
 
