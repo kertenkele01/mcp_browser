@@ -422,7 +422,7 @@ function sendSseJsonRpc(sessionId, jsonRpcMessage) {
 }
 
 app.get('/sse', (req, res) => {
-    const sessionId = randomUUID();
+    const sessionId = req.query.sessionId || `ai_session_${randomUUID().substring(0, 8)}`;
     
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
