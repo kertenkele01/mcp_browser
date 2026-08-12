@@ -214,6 +214,43 @@ const TOOLS = [
             },
             required: ["tabId"]
         }
+    },
+    {
+        name: "browser_get_session_info",
+        description: "Mevcut tarayıcı oturumunun ve profilinin bilgilerini (Oturum ID, Güvenlik Token'ı, Çerez Durumu, İstemci Adı ve Sekme Sayısı) getirir.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            }
+        }
+    },
+    {
+        name: "browser_switch_session",
+        description: "Belirtilen hedef AI veya kişisel oturuma geçiş yapar. Farklı bir AI oturumuna dönmek veya kişisel oturuma geçmek için kullanılır.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                targetSessionId: { type: "string", description: "Geçilmek istenen oturum ID'si (örn. 'ai_session_cursor', 'personal_browser')" },
+                sessionToken: { type: "string", description: "Güvenlik token'ı (opsiyonel)" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            },
+            required: ["targetSessionId"]
+        }
+    },
+    {
+        name: "browser_clear_session_data",
+        description: "Mevcut veya belirtilen tarayıcı oturumunun çerezlerini, önbelleğini ve gezinti geçmişini temizler.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                targetSessionId: { type: "string", description: "Temizlenecek oturum ID'si (opsiyonel, belirtilmezse mevcut oturum)" },
+                clearCookies: { type: "boolean", description: "Çerezleri sil (Varsayılan: true)" },
+                clearCache: { type: "boolean", description: "Önbelleği sil (Varsayılan: true)" },
+                clearHistory: { type: "boolean", description: "Geçmişi sil (Varsayılan: true)" },
+                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
+            }
+        }
     }
 ];
 
@@ -566,6 +603,9 @@ app.post('/message', async (req, res) => {
             case "browser_close_tab": actionType = "close_tab"; break;
             case "browser_list_tabs": actionType = "list_tabs"; break;
             case "browser_switch_tab": actionType = "switch_tab"; break;
+            case "browser_get_session_info": actionType = "get_session_info"; break;
+            case "browser_switch_session": actionType = "switch_session_mcp"; break;
+            case "browser_clear_session_data": actionType = "clear_session_data"; break;
             default:
                 reply(null, { code: -32601, message: `Tool not found: ${toolName}` });
                 return res.status(200).send("accepted");
