@@ -307,7 +307,7 @@ function getBrowserWsForSession(sessionId = 'default_session', requestedDeviceId
 }
 
 // Helper to route command to Android browser and await result
-function routeCommandToBrowser(type, args, targetDeviceId, sessionId = 'default_session', clientName = 'Yapay Zeka') {
+function routeCommandToBrowser(type, args, targetDeviceId, sessionId = 'default_session', clientName = 'Yapay Zeka', token = '') {
     return new Promise((resolve, reject) => {
         const { ws, deviceId } = getBrowserWsForSession(sessionId, targetDeviceId);
         if (!ws) {
@@ -320,6 +320,7 @@ function routeCommandToBrowser(type, args, targetDeviceId, sessionId = 'default_
             messageId,
             sessionId,
             clientName,
+            token,
             ...args
         });
 
@@ -459,7 +460,19 @@ function sendSseJsonRpc(sessionId, jsonRpcMessage) {
 }
 
 app.get('/sse', (req, res) => {
-    const sessionId = req.query.sessionId || `ai_session_${randomUUID().substring(0, 8)}`;
+    const reqToken = req.query.token || req.query.profileId || req.headers['x-mcp-token'] || req.headers['x-api-key'] || '';
+    const reqClientName = req.query.clientName || req.query.name || req.query.agentName || '';
+
+    let sessionId = req.query.sessionId;
+    if (!sessionId) {
+        if (reqToken) {
+            sessionId = `token_${reqToken}`;
+        } else if (reqClientName) {
+            sessionId = `client_${reqClientName.toLowerCase().replace(/[^a-z0-9_]/g, '_')}`;
+        } else {
+            sessionId = `ai_session_${randomUUID().substring(0, 8)}`;
+        }
+    }
     
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -476,9 +489,9 @@ app.get('/sse', (req, res) => {
         res.write(':\n\n');
     }, 15000);
 
-    sseSessions.set(sessionId, { res, clientInfo: { name: 'İstemci Doğrulanıyor' } });
-    console.log(`[MCP] SSE Session created: ${sessionId}`);
-    addLog(sessionId, 'Bağlanıyor', null, 'SSE Bağlantısı', 'info', 'İstemci SSE kanalı üzerinden bağlantı başlattı.');
+    sseSessions.set(sessionId, { res, clientInfo: { name: reqClientName || 'İstemci Doğrulanıyor' }, token: reqToken, clientName: reqClientName });
+    console.log(`[MCP] SSE Session created: ${sessionId} (Client: ${reqClientName || 'N/A'}, Token: ${reqToken ? 'YES' : 'NO'})`);
+    addLog(sessionId, reqClientName || 'Bağlanıyor', null, 'SSE Bağlantısı', 'info', 'İstemci SSE kanalı üzerinden bağlantı başlattı.');
 
     // Construct ABSOLUTE POST URL for MCP client to avoid relative path resolution bugs in clients like Cursor/Claude Desktop
     const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
@@ -491,7 +504,7 @@ app.get('/sse', (req, res) => {
     req.on('close', () => {
         clearInterval(heartbeatInterval);
         const session = sseSessions.get(sessionId);
-        const clientName = session ? (session.clientInfo ? session.clientInfo.name : 'N/A') : 'N/A';
+        const clientName = session ? (session.clientName || (session.clientInfo ? session.clientInfo.name : 'N/A')) : 'N/A';
         sseSessions.delete(sessionId);
         console.log(`[MCP] SSE Session closed: ${sessionId}`);
         addLog(sessionId, clientName, null, 'Bağlantı Kesildi', 'info', 'SSE kanalı kapatıldı.');
@@ -524,7 +537,7 @@ app.post('/message', async (req, res) => {
             console.log(`[MCP] Handshake completed successfully! Session: ${sessionId}`);
             const session = sseSessions.get(sessionId);
             if (session && session.clientInfo) {
-                addLog(sessionId, session.clientInfo.name, null, 'Sistem Hazır', 'success', 'MCP Handshake başarıyla tamamlandı. İstemci hazır.');
+                addLog(sessionId, session.clientName || session.clientInfo.name, null, 'Sistem Hazır', 'success', 'MCP Handshake başarıyla tamamlandı. İstemci hazır.');
             }
         }
         return res.status(202).send("accepted");
@@ -547,6 +560,9 @@ app.post('/message', async (req, res) => {
         const session = sseSessions.get(sessionId);
         if (session) {
             session.clientInfo = clientInfo;
+            if (clientInfo.name && clientInfo.name !== 'Belirtilmeyen Yapay Zeka') {
+                session.clientName = clientInfo.name;
+            }
         }
         addLog(sessionId, clientInfo.name, null, 'Başlatma Handshake', 'success', `Yapay zeka asistanı bağlandı: ${clientInfo.name} (v${clientInfo.version || 'unknown'}).`);
 
@@ -612,12 +628,16 @@ app.post('/message', async (req, res) => {
         }
 
         const session = sseSessions.get(sessionId);
-        const clientName = session ? (session.clientInfo ? session.clientInfo.name : 'MCP İstemcisi') : 'MCP İstemcisi';
+        const clientName = (session && session.clientName) ? session.clientName : 
+                           (session && session.clientInfo && session.clientInfo.name) ? session.clientInfo.name : 
+                           req.query.clientName || 'Yapay Zeka';
+        const token = (session && session.token) ? session.token : 
+                      req.query.token || req.query.profileId || '';
 
         try {
             const { deviceId: resolvedDeviceId } = getBrowserWsForSession(sessionId, deviceId);
             addLog(sessionId, clientName, resolvedDeviceId || deviceId || 'Varsayılan Cihaz', `Araç Çağrısı: ${toolName}`, 'pending', `Komut gönderiliyor. Parametreler: ${JSON.stringify(cleanArgs)}`);
-            let responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId, sessionId, clientName);
+            let responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId, sessionId, clientName, token);
             responseData = await processCrawl4AIEngine(toolName, responseData, req.headers, sessionId, clientName, deviceId);
 
             let details = "Komut başarıyla yürütüldü.";
