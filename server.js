@@ -459,14 +459,26 @@ function sendSseJsonRpc(sessionId, jsonRpcMessage) {
     }
 }
 
+function extractBearerToken(req) {
+    const authHeader = req.headers['authorization'] || req.headers['Authorization'] || '';
+    if (authHeader) {
+        if (authHeader.toLowerCase().startsWith('bearer ')) {
+            return authHeader.substring(7).trim();
+        }
+        return authHeader.trim();
+    }
+    return req.query.token || req.query.profileId || req.query.bearer || req.headers['x-mcp-token'] || req.headers['x-api-key'] || '';
+}
+
 app.get('/sse', (req, res) => {
-    const reqToken = req.query.token || req.query.profileId || req.headers['x-mcp-token'] || req.headers['x-api-key'] || '';
+    const reqToken = extractBearerToken(req);
     const reqClientName = req.query.clientName || req.query.name || req.query.agentName || '';
 
     let sessionId = req.query.sessionId;
     if (!sessionId) {
         if (reqToken) {
-            sessionId = `token_${reqToken}`;
+            const cleanToken = reqToken.replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
+            sessionId = `token_${cleanToken}`;
         } else if (reqClientName) {
             sessionId = `client_${reqClientName.toLowerCase().replace(/[^a-z0-9_]/g, '_')}`;
         } else {
@@ -490,8 +502,8 @@ app.get('/sse', (req, res) => {
     }, 15000);
 
     sseSessions.set(sessionId, { res, clientInfo: { name: reqClientName || 'İstemci Doğrulanıyor' }, token: reqToken, clientName: reqClientName });
-    console.log(`[MCP] SSE Session created: ${sessionId} (Client: ${reqClientName || 'N/A'}, Token: ${reqToken ? 'YES' : 'NO'})`);
-    addLog(sessionId, reqClientName || 'Bağlanıyor', null, 'SSE Bağlantısı', 'info', 'İstemci SSE kanalı üzerinden bağlantı başlattı.');
+    console.log(`[MCP] SSE Session created: ${sessionId} (Client: ${reqClientName || 'N/A'}, Token: ${reqToken ? reqToken.substring(0, 10) + '...' : 'NONE'})`);
+    addLog(sessionId, reqClientName || 'Bağlanıyor', null, 'SSE Bağlantısı', 'info', `İstemci SSE kanalı üzerinden bağlantı başlattı. Token: ${reqToken || 'Yok'}`);
 
     // Construct ABSOLUTE POST URL for MCP client to avoid relative path resolution bugs in clients like Cursor/Claude Desktop
     const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
@@ -513,13 +525,20 @@ app.get('/sse', (req, res) => {
 
 // Post endpoint for standard MCP client
 app.post('/message', async (req, res) => {
-    const { sessionId } = req.query;
+    let { sessionId } = req.query;
+    const reqToken = extractBearerToken(req);
+
+    if (!sessionId && reqToken) {
+        const cleanToken = reqToken.replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
+        sessionId = `token_${cleanToken}`;
+    }
+
     const rpcRequest = req.body;
 
-    console.log(`[MCP] Incoming JSON-RPC Request (Session: ${sessionId}):`, JSON.stringify(rpcRequest));
+    console.log(`[MCP] Incoming JSON-RPC Request (Session: ${sessionId}, Token: ${reqToken || 'N/A'}):`, JSON.stringify(rpcRequest));
 
     if (!sessionId) {
-        return res.status(400).json({ error: "Missing sessionId query parameter" });
+        return res.status(400).json({ error: "Missing sessionId or Authorization token" });
     }
 
     if (!rpcRequest || typeof rpcRequest !== 'object') {
