@@ -12,9 +12,7 @@ const wss = new WebSocketServer({ server: httpServer });
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
-// Connected Android devices map: deviceId -> WebSocket
 const androidDevices = new Map();
-// Pending promises: messageId -> { resolve, reject, timeout }
 const pendingRequests = new Map();
 
 // --- WebSocket Handling for Android Device ---
@@ -83,7 +81,7 @@ function sendCommandToDevice(deviceId, commandType, params = {}) {
   });
 }
 
-// --- MCP Tools Definition ---
+// --- MCP TOOLS ---
 const MCP_TOOLS = [
   // 🌐 BROWSER TOOLS
   {
@@ -91,9 +89,7 @@ const MCP_TOOLS = [
     description: 'Android WebView tarayıcısında belirtilen URL adresine gider.',
     inputSchema: {
       type: 'object',
-      properties: {
-        url: { type: 'string', description: 'Açılacak web sitesi URL adresi (örn: https://google.com)' }
-      },
+      properties: { url: { type: 'string', description: 'Açılacak web sitesi URL adresi' } },
       required: ['url']
     }
   },
@@ -102,9 +98,7 @@ const MCP_TOOLS = [
     description: 'Aktif web sayfasındaki bir HTML öğesine tıklar.',
     inputSchema: {
       type: 'object',
-      properties: {
-        selector: { type: 'string', description: 'Tıklanacak CSS seçici (örn: button#submit, a.login-btn)' }
-      },
+      properties: { selector: { type: 'string', description: 'CSS seçici' } },
       required: ['selector']
     }
   },
@@ -114,7 +108,7 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        selector: { type: 'string', description: 'CSS seçici (örn: input[name=q])' },
+        selector: { type: 'string', description: 'CSS seçici' },
         text: { type: 'string', description: 'Yazılacak metin' }
       },
       required: ['selector', 'text']
@@ -126,19 +120,19 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'], description: 'Kaydırma yönü' },
-        amount: { type: 'integer', description: 'Kaydırılacak piksel miktarı (varsayılan 500)' }
+        direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] },
+        amount: { type: 'integer' }
       }
     }
   },
   {
     name: 'browser_get_html',
-    description: 'Sayfanın optimize edilmiş Markdown veya HTML içeriğini döker.',
+    description: 'Sayfanın optimize edilmiş HTML içeriğini döker.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'browser_get_markdown',
-    description: 'Sayfanın yapay zeka için temizlenmiş Markdown içeriğini döker.',
+    description: 'Sayfanın temizlenmiş Markdown içeriğini döker.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
@@ -148,12 +142,10 @@ const MCP_TOOLS = [
   },
   {
     name: 'browser_execute_js',
-    description: 'Web sayfasında özel JavaScript kodu çalıştırır.',
+    description: 'Web sayfasında JavaScript kodu çalıştırır.',
     inputSchema: {
       type: 'object',
-      properties: {
-        script: { type: 'string', description: 'Çalıştırılacak JS kodu' }
-      },
+      properties: { script: { type: 'string', description: 'JS kodu' } },
       required: ['script']
     }
   },
@@ -162,9 +154,7 @@ const MCP_TOOLS = [
     description: 'Yeni bir tarayıcı sekmesi açar.',
     inputSchema: {
       type: 'object',
-      properties: {
-        url: { type: 'string', description: 'Yeni sekmede açılacak opsiyonel URL' }
-      }
+      properties: { url: { type: 'string' } }
     }
   },
   {
@@ -172,9 +162,7 @@ const MCP_TOOLS = [
     description: 'Belirtilen sekmeye geçiş yapar.',
     inputSchema: {
       type: 'object',
-      properties: {
-        tabId: { type: 'string', description: 'Geçilecek sekme IDsi' }
-      },
+      properties: { tabId: { type: 'string' } },
       required: ['tabId']
     }
   },
@@ -183,9 +171,7 @@ const MCP_TOOLS = [
     description: 'Belirtilen tarayıcı sekmesini kapatır.',
     inputSchema: {
       type: 'object',
-      properties: {
-        tabId: { type: 'string', description: 'Kapatılacak sekme IDsi' }
-      },
+      properties: { tabId: { type: 'string' } },
       required: ['tabId']
     }
   },
@@ -198,48 +184,45 @@ const MCP_TOOLS = [
   // 📱 ANDROID CİHAZ & SHIZUKU TOOLS
   {
     name: 'get_device_ui',
-    description: 'Açık olan Android uygulamasının (WhatsApp, Instagram, Ayarlar, Galeri vb.) ekran UI buton, metin ve tıklanabilir koordinat [X, Y] ağacını sıkıştırılmış Markdown olarak döker.',
-    inputSchema: {
-      type: 'object',
-      properties: {}
-    }
+    description: 'Açık olan Android uygulamasının (WhatsApp, Ayarlar vb.) buton, metin ve koordinat ağacını sıkıştırılmış Markdown olarak döker.',
+    inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'device_action',
-    description: 'Android cihazda tıklama, metin yazma, ekran kaydırma, sistem tuşuna basma veya uygulama başlatma eylemlerini yürütür.',
+    description: 'Android cihazda tıklama, metin yazma, kaydırma, tuşa basma veya uygulama başlatma eylemlerini yürütür.',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
           enum: ['click', 'type', 'swipe', 'key_press', 'open_app', 'stop_app'],
-          description: 'Eylem türü (click, type, swipe, key_press, open_app, stop_app)'
+          description: 'Eylem türü'
         },
-        x: { type: 'integer', description: 'Tıklanacak X piksel koordinatı (click için)' },
-        y: { type: 'integer', description: 'Tıklanacak Y piksel koordinatı (click için)' },
-        text: { type: 'string', description: 'Yazılacak metin (type için)' },
-        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Kaydırma yönü (swipe için)' },
-        distance: { type: 'integer', description: 'Kaydırma mesafesi piksel (swipe için, varsayılan 500)' },
-        key: { type: 'string', enum: ['HOME', 'BACK', 'ENTER', 'APP_SWITCH', 'POWER', 'VOLUME_UP', 'VOLUME_DOWN'], description: 'Sistem tuşu (key_press için)' },
-        app: { type: 'string', description: 'Uygulama paket adı (open_app için, örn: com.whatsapp, com.android.settings)' }
+        x: { type: 'integer', description: 'Tıklanacak X koordinatı' },
+        y: { type: 'integer', description: 'Tıklanacak Y koordinatı' },
+        text: { type: 'string', description: 'Yazılacak metin' },
+        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Kaydırma yönü' },
+        distance: { type: 'integer', description: 'Kaydırma pikseli' },
+        key: { type: 'string', enum: ['HOME', 'BACK', 'ENTER', 'APP_SWITCH', 'POWER'], description: 'Sistem tuşu' },
+        app: { type: 'string', description: 'Uygulama paket adı (örn: com.whatsapp)' }
       },
       required: ['action']
     }
   },
   {
     name: 'run_shizuku_cmd',
-    description: 'Shizuku / ADB yetkileriyle cihaz üzerinde doğrudan Android Shell terminal komutu koşturur.',
+    description: 'Shizuku / ADB yetkileriyle doğrudan Android Shell komutu koşturur.',
     inputSchema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'Çalıştırılacak shell komutu (örn: pm list packages, input keyevent 3, dumpsys battery)' }
+        command: { type: 'string', description: 'Çalıştırılacak shell komutu' }
       },
       required: ['command']
     }
   }
 ];
 
-// --- MCP SSE Transport Setup ---
+// --- MCP SSE Server Transport ---
 let sseTransport = null;
 
 app.get('/sse', async (req, res) => {
@@ -302,90 +285,70 @@ app.post('/messages', async (req, res) => {
   }
 });
 
-// --- Web Dashboard UI ---
+// --- Orijinal Temiz Web Paneli ---
 app.get('/', (req, res) => {
   const activeDeviceCount = androidDevices.size;
-  const deviceListHtml = Array.from(androidDevices.keys())
-    .map(id => `<span class="badge online">🟢 ${id}</span>`)
-    .join(' ') || '<span class="badge offline">🔴 Hiçbir Android cihaz bağlı değil</span>';
-
-  const browserToolsHtml = MCP_TOOLS.filter(t => t.name.startsWith('browser_'))
-    .map(t => `<div class="tool-item"><span class="tool-name">${t.name}</span><p class="tool-desc">${t.description}</p></div>`)
-    .join('');
-
-  const deviceToolsHtml = MCP_TOOLS.filter(t => !t.name.startsWith('browser_'))
-    .map(t => `<div class="tool-item device"><span class="tool-name device-tag">${t.name}</span><p class="tool-desc">${t.description}</p></div>`)
-    .join('');
+  const deviceList = Array.from(androidDevices.keys()).join(', ') || 'Hiçbir cihaz bağlı değil';
 
   res.send(`
     <!DOCTYPE html>
     <html lang="tr">
     <head>
       <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Android & Browser MCP Relay Server</title>
+      <title>Android Browser & Device MCP Server</title>
       <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-        body { background: #0f172a; color: #f8fafc; padding: 2rem 1rem; display: flex; justify-content: center; }
-        .container { max-width: 900px; width: 100%; }
-        .card { background: #1e293b; border-radius: 16px; padding: 1.5rem; margin-bottom: 1.5rem; border: 1px solid #334155; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3); }
-        h1 { font-size: 1.6rem; color: #38bdf8; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
-        p.subtitle { color: #94a3b8; font-size: 0.95rem; margin-bottom: 1rem; }
-        .status-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; padding: 0.75rem 0; border-top: 1px solid #334155; }
-        .badge { padding: 0.35rem 0.75rem; border-radius: 9999px; font-size: 0.85rem; font-weight: 600; }
-        .badge.online { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid #22c55e; }
-        .badge.offline { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
-        .section-title { font-size: 1.15rem; font-weight: 700; color: #f1f5f9; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
-        .tools-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.75rem; }
-        .tool-item { background: #0f172a; padding: 0.85rem; border-radius: 10px; border: 1px solid #334155; }
-        .tool-item.device { border-color: rgba(34, 197, 94, 0.4); background: rgba(15, 23, 42, 0.8); }
-        .tool-name { font-family: monospace; font-size: 0.9rem; font-weight: 700; color: #38bdf8; }
-        .tool-name.device-tag { color: #4ade80; }
-        .tool-desc { font-size: 0.8rem; color: #94a3b8; margin-top: 0.35rem; line-height: 1.3; }
-        .config-code { background: #090d16; padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.85rem; color: #e2e8f0; overflow-x: auto; white-space: pre; border: 1px solid #1e293b; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 2rem; background: #f8fafc; color: #1e293b; max-width: 800px; margin: 0 auto; line-height: 1.5; }
+        h1 { color: #0f172a; border-bottom: 2px solid #e2e8f0; padding-bottom: 0.5rem; }
+        .status { padding: 1rem; border-radius: 8px; margin: 1.5rem 0; background: ${activeDeviceCount > 0 ? '#dcfce7' : '#fee2e2'}; border: 1px solid ${activeDeviceCount > 0 ? '#86efac' : '#fca5a5'}; }
+        .code { background: #1e293b; color: #f8fafc; padding: 1rem; border-radius: 8px; font-family: monospace; overflow-x: auto; margin: 1rem 0; }
+        ul { padding-left: 1.5rem; }
+        li { margin-bottom: 0.4rem; }
+        .badge { background: #e0f2fe; color: #0369a1; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-family: monospace; }
+        .device-badge { background: #dcfce7; color: #15803d; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-family: monospace; }
       </style>
     </head>
     <body>
-      <div class="container">
-        <div class="card">
-          <h1>🤖 Android & Browser MCP Bridge Server</h1>
-          <p class="subtitle">Android WebView ve Shizuku Cihaz Otomasyonu için Canlı Model Context Protocol Sunucusu</p>
-          
-          <div class="status-row">
-            <span>Bağlı Android Cihazları (${activeDeviceCount})</span>
-            <div>${deviceListHtml}</div>
-          </div>
-          <div class="status-row">
-            <span>MCP SSE Endpoint:</span>
-            <code style="color: #38bdf8; font-weight: 600;">/sse</code>
-          </div>
-        </div>
+      <h1>🌐 Android Browser & Device MCP Server</h1>
+      <p>Bu sunucu, Android cihazınız ile Yapay Zeka (Cursor / Claude / Windsurf) arasında MCP köprüsü kurar.</p>
+      
+      <div class="status">
+        <strong>Bağlı Cihaz Sayısı:</strong> ${activeDeviceCount}<br>
+        <strong>Aktif Cihazlar:</strong> ${deviceList}
+      </div>
 
-        <div class="card">
-          <div class="section-title">📱 Android Cihaz & Shizuku Araçları (Device Tools)</div>
-          <div class="tools-grid">
-            ${deviceToolsHtml}
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="section-title">🌐 Tarayıcı Araçları (Browser Tools)</div>
-          <div class="tools-grid">
-            ${browserToolsHtml}
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="section-title">⚙️ Cursor / Claude Desktop Yapılandırması</div>
-          <div class="config-code">{
+      <h2>🔌 MCP İstemci Yapılandırması (SSE)</h2>
+      <div class="code">{
   "mcpServers": {
     "android-mcp": {
       "url": "https://${req.headers.host || 'mcp-browser-1.onrender.com'}/sse"
     }
   }
 }</div>
-        </div>
-      </div>
+
+      <h2>🛠️ Desteklenen MCP Araçları (Tools)</h2>
+      
+      <h3>🌐 Tarayıcı Araçları (Browser)</h3>
+      <ul>
+        <li><span class="badge">browser_navigate</span> - Web sitesine gider.</li>
+        <li><span class="badge">browser_click</span> - Sayfadaki öğeye tıklar.</li>
+        <li><span class="badge">browser_type</span> - Metin kutusuna yazı yazar.</li>
+        <li><span class="badge">browser_scroll</span> - Sayfayı kaydırır.</li>
+        <li><span class="badge">browser_get_html</span> - Sayfanın HTML/Markdown kodunu döker.</li>
+        <li><span class="badge">browser_get_markdown</span> - Sayfanın temizlenmiş Markdown içeriğini döker.</li>
+        <li><span class="badge">browser_screenshot</span> - Tarayıcının ekran görüntüsünü çeker.</li>
+        <li><span class="badge">browser_execute_js</span> - Özel JavaScript kodu çalıştırır.</li>
+        <li><span class="badge">browser_new_tab</span> - Yeni sekme açar.</li>
+        <li><span class="badge">browser_switch_tab</span> - Sekmeler arası geçiş yapar.</li>
+        <li><span class="badge">browser_close_tab</span> - Sekmeyi kapatır.</li>
+        <li><span class="badge">browser_list_tabs</span> - Tüm açık sekmeleri listeler.</li>
+      </ul>
+
+      <h3 style="margin-top: 1.5rem; color: #15803d;">📱 Android Cihaz & Shizuku Araçları (Device)</h3>
+      <ul>
+        <li><span class="device-badge">get_device_ui</span> - Açık olan Android uygulamasının ekran UI buton ve metin ağacını koordinatlarıyla döker.</li>
+        <li><span class="device-badge">device_action</span> - Android cihazda tıklama, metin yazma, kaydırma, sistem tuşuna basma veya uygulama açma eylemlerini yürütür.</li>
+        <li><span class="device-badge">run_shizuku_cmd</span> - Shizuku / ADB yetkileriyle doğrudan Android Shell terminal komutu koşturur.</li>
+      </ul>
     </body>
     </html>
   `);
