@@ -1,18 +1,15 @@
-import express from 'express';
-import { createServer } from 'http';
-import { WebSocketServer, WebSocket } from 'ws';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
 
 const app = express();
-const httpServer = createServer(app);
-const wss = new WebSocketServer({ server: httpServer });
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
-const androidDevices = new Map();
+const devices = new Map();
 const pendingRequests = new Map();
 
 // --- WebSocket Handling for Android Device ---
@@ -31,7 +28,7 @@ wss.on('connection', (ws, req) => {
           return;
         }
         registeredDeviceId = deviceId || 'android_default';
-        androidDevices.set(registeredDeviceId, ws);
+        devices.set(registeredDeviceId, ws);
         console.log(`[WS] Android device registered: ${registeredDeviceId}`);
         ws.send(JSON.stringify({ type: 'registered', deviceId: registeredDeviceId }));
         return;
@@ -52,7 +49,7 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     if (registeredDeviceId) {
-      androidDevices.delete(registeredDeviceId);
+      devices.delete(registeredDeviceId);
       console.log(`[WS] Android device disconnected: ${registeredDeviceId}`);
     }
   });
@@ -60,7 +57,7 @@ wss.on('connection', (ws, req) => {
 
 function sendCommandToDevice(deviceId, commandType, params = {}) {
   return new Promise((resolve, reject) => {
-    const ws = androidDevices.get(deviceId || 'android_default') || androidDevices.values().next().value;
+    const ws = devices.get(deviceId || 'android_default') || devices.values().next().value;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return reject(new Error('Android cihazı bağlı değil. Lütfen uygulamayı açın ve MCP bağlantısını başlatın.'));
     }
@@ -81,7 +78,7 @@ function sendCommandToDevice(deviceId, commandType, params = {}) {
   });
 }
 
-// --- MCP TOOLS (BROWSER + DEVICE) ---
+// --- MCP Tools Definition ---
 const MCP_TOOLS = [
   // 🌐 BROWSER TOOLS
   {
@@ -89,16 +86,16 @@ const MCP_TOOLS = [
     description: 'Android WebView tarayıcısında belirtilen URL adresine gider.',
     inputSchema: {
       type: 'object',
-      properties: { url: { type: 'string', description: 'Açılacak web sitesi URL adresi' } },
+      properties: { url: { type: 'string', description: 'Açılacak web sitesi URL adresi (örn: https://google.com)' } },
       required: ['url']
     }
   },
   {
     name: 'browser_click',
-    description: 'Aktif web sayfasındaki bir HTML öğesine tıklar.',
+    description: 'Aktif web sayfasındaki bir HTML öğesine CSS seçici ile tıklar.',
     inputSchema: {
       type: 'object',
-      properties: { selector: { type: 'string', description: 'CSS seçici' } },
+      properties: { selector: { type: 'string', description: 'Tıklanacak CSS seçici (örn: button#submit, a.link)' } },
       required: ['selector']
     }
   },
@@ -108,7 +105,7 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        selector: { type: 'string', description: 'CSS seçici' },
+        selector: { type: 'string', description: 'CSS seçici (örn: input[name=q])' },
         text: { type: 'string', description: 'Yazılacak metin' }
       },
       required: ['selector', 'text']
@@ -120,19 +117,19 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] },
-        amount: { type: 'integer' }
+        direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'], description: 'Kaydırma yönü' },
+        amount: { type: 'integer', description: 'Kaydırılacak piksel miktarı' }
       }
     }
   },
   {
     name: 'browser_get_html',
-    description: 'Sayfanın optimize edilmiş HTML içeriğini döker.',
+    description: 'Sayfanın optimize edilmiş Markdown ve HTML içeriğini döker.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'browser_get_markdown',
-    description: 'Sayfanın temizlenmiş Markdown içeriğini döker.',
+    description: 'Sayfanın yapay zeka için temizlenmiş Markdown içeriğini döker.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
@@ -145,7 +142,7 @@ const MCP_TOOLS = [
     description: 'Web sayfasında JavaScript kodu çalıştırır.',
     inputSchema: {
       type: 'object',
-      properties: { script: { type: 'string', description: 'JS kodu' } },
+      properties: { script: { type: 'string', description: 'Çalıştırılacak JS kodu' } },
       required: ['script']
     }
   },
@@ -154,7 +151,7 @@ const MCP_TOOLS = [
     description: 'Yeni bir tarayıcı sekmesi açar.',
     inputSchema: {
       type: 'object',
-      properties: { url: { type: 'string' } }
+      properties: { url: { type: 'string', description: 'Yeni sekmede açılacak opsiyonel URL' } }
     }
   },
   {
@@ -162,7 +159,7 @@ const MCP_TOOLS = [
     description: 'Belirtilen sekmeye geçiş yapar.',
     inputSchema: {
       type: 'object',
-      properties: { tabId: { type: 'string' } },
+      properties: { tabId: { type: 'string', description: 'Geçilecek sekme IDsi' } },
       required: ['tabId']
     }
   },
@@ -171,7 +168,7 @@ const MCP_TOOLS = [
     description: 'Belirtilen tarayıcı sekmesini kapatır.',
     inputSchema: {
       type: 'object',
-      properties: { tabId: { type: 'string' } },
+      properties: { tabId: { type: 'string', description: 'Kapatılacak sekme IDsi' } },
       required: ['tabId']
     }
   },
@@ -184,12 +181,12 @@ const MCP_TOOLS = [
   // 📱 ANDROID CİHAZ & SHIZUKU TOOLS
   {
     name: 'get_device_ui',
-    description: 'Açık olan Android uygulamasının (WhatsApp, Ayarlar vb.) buton, metin ve koordinat ağacını sıkıştırılmış Markdown olarak döker.',
+    description: 'Açık olan Android uygulamasının (WhatsApp, Instagram, Ayarlar vb.) buton, metin ve tıklanabilir koordinat [X, Y] ağacını sıkıştırılmış Markdown olarak döker.',
     inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'device_action',
-    description: 'Android cihazda tıklama, metin yazma, kaydırma, tuşa basma veya uygulama başlatma eylemlerini yürütür.',
+    description: 'Android cihazda tıklama, metin yazma, kaydırma, sistem tuşuna basma veya uygulama başlatma eylemlerini yürütür.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -198,11 +195,11 @@ const MCP_TOOLS = [
           enum: ['click', 'type', 'swipe', 'key_press', 'open_app', 'stop_app'],
           description: 'Eylem türü'
         },
-        x: { type: 'integer', description: 'Tıklanacak X koordinatı' },
-        y: { type: 'integer', description: 'Tıklanacak Y koordinatı' },
-        text: { type: 'string', description: 'Yazılacak metin' },
-        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Kaydırma yönü' },
-        distance: { type: 'integer', description: 'Kaydırma pikseli' },
+        x: { type: 'integer', description: 'Tıklanacak X koordinatı (click için)' },
+        y: { type: 'integer', description: 'Tıklanacak Y koordinatı (click için)' },
+        text: { type: 'string', description: 'Yazılacak metin (type için)' },
+        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Kaydırma yönü (swipe için)' },
+        distance: { type: 'integer', description: 'Kaydırma mesafesi piksel (swipe için)' },
         key: { type: 'string', enum: ['HOME', 'BACK', 'ENTER', 'APP_SWITCH', 'POWER', 'VOLUME_UP', 'VOLUME_DOWN'], description: 'Sistem tuşu' },
         app: { type: 'string', description: 'Uygulama paket adı (örn: com.whatsapp)' }
       },
@@ -211,37 +208,65 @@ const MCP_TOOLS = [
   },
   {
     name: 'run_shizuku_cmd',
-    description: 'Shizuku / ADB yetkileriyle doğrudan Android Shell komutu koşturur.',
+    description: 'Shizuku / ADB yetkileriyle cihaz üzerinde doğrudan Android Shell terminal komutu koşturur.',
     inputSchema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'Çalıştırılacak shell komutu' }
+        command: { type: 'string', description: 'Çalıştırılacak shell komutu (örn: pm list packages, dumpsys battery)' }
       },
       required: ['command']
     }
   }
 ];
 
-// --- MCP SSE Server Transport ---
-let sseTransport = null;
+// --- MCP SSE Endpoints (Cursor & Claude Desktop uyumlu) ---
+const sseClients = new Set();
 
-app.get('/sse', async (req, res) => {
-  console.log('[SSE] New MCP client connected');
-  sseTransport = new SSEServerTransport('/messages', res);
-  
-  const mcpServer = new Server(
-    { name: 'android-browser-bridge-mcp', version: '2.0.0' },
-    { capabilities: { tools: {} } }
-  );
+app.use(express.json());
 
-  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: MCP_TOOLS };
+app.get('/sse', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*'
   });
 
-  mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-    console.log(`[MCP] Tool invoked: ${name}`, args);
+  const endpointUrl = `https://${req.headers.host || 'mcp-browser-1.onrender.com'}/messages`;
+  res.write(`event: endpoint\ndata: ${endpointUrl}\n\n`);
 
+  sseClients.add(res);
+
+  req.on('close', () => {
+    sseClients.delete(res);
+  });
+});
+
+app.post('/messages', async (req, res) => {
+  const { jsonrpc, id, method, params } = req.body;
+
+  if (method === 'initialize') {
+    return res.json({
+      jsonrpc: '2.0',
+      id,
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'android-browser-bridge-mcp', version: '2.0.0' }
+      }
+    });
+  }
+
+  if (method === 'tools/list') {
+    return res.json({
+      jsonrpc: '2.0',
+      id,
+      result: { tools: MCP_TOOLS }
+    });
+  }
+
+  if (method === 'tools/call') {
+    const { name, arguments: args } = params || {};
     try {
       let result;
       if (name.startsWith('browser_')) {
@@ -257,38 +282,37 @@ app.get('/sse', async (req, res) => {
         throw new Error(`Bilinmeyen araç: ${name}`);
       }
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: typeof result?.data === 'string' ? result.data : JSON.stringify(result?.data || result, null, 2)
-          }
-        ]
-      };
+      return res.json({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: typeof result?.data === 'string' ? result.data : JSON.stringify(result?.data || result, null, 2)
+            }
+          ]
+        }
+      });
     } catch (err) {
-      console.error(`[MCP] Error running tool ${name}:`, err);
-      return {
-        isError: true,
-        content: [{ type: 'text', text: `Hata: ${err.message}` }]
-      };
+      return res.json({
+        jsonrpc: '2.0',
+        id,
+        result: {
+          isError: true,
+          content: [{ type: 'text', text: `Hata: ${err.message}` }]
+        }
+      });
     }
-  });
-
-  await mcpServer.connect(sseTransport);
-});
-
-app.post('/messages', async (req, res) => {
-  if (sseTransport) {
-    await sseTransport.handlePostMessage(req, res);
-  } else {
-    res.status(400).send('No active SSE connection');
   }
+
+  return res.json({ jsonrpc: '2.0', id, result: {} });
 });
 
-// --- Orijinal Temiz Web Paneli ---
+// --- Eski Orijinal Web Paneli ---
 app.get('/', (req, res) => {
-  const activeDeviceCount = androidDevices.size;
-  const deviceList = Array.from(androidDevices.keys()).join(', ') || 'Hiçbir cihaz bağlı değil';
+  const activeDeviceCount = devices.size;
+  const deviceList = Array.from(devices.keys()).join(', ') || 'Hiçbir cihaz bağlı değil';
 
   res.send(`
     <!DOCTYPE html>
@@ -354,7 +378,6 @@ app.get('/', (req, res) => {
   `);
 });
 
-httpServer.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`[HTTP/WS] Server listening on port ${PORT}`);
-  console.log(`[MCP] SSE endpoint available at /sse`);
 });
