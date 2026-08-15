@@ -1,1407 +1,360 @@
-const express = require('express');
-const { createServer } = require('http');
-const { WebSocketServer } = require('ws');
-const { randomUUID } = require('crypto');
+import express from 'express';
+import { createServer } from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+const httpServer = createServer(app);
+const wss = new WebSocketServer({ server: httpServer });
 
-// CORS Support
-app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-mcp-token');
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
+const PORT = process.env.PORT || 3000;
+const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+
+const androidDevices = new Map();
+const pendingRequests = new Map();
+
+// --- WebSocket Handling for Android Device ---
+wss.on('connection', (ws, req) => {
+  let registeredDeviceId = null;
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+
+      if (data.type === 'register') {
+        const { deviceId, token } = data;
+        if (AUTH_TOKEN && token !== AUTH_TOKEN) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized' }));
+          ws.close();
+          return;
+        }
+        registeredDeviceId = deviceId || 'android_default';
+        androidDevices.set(registeredDeviceId, ws);
+        console.log(`[WS] Android device registered: ${registeredDeviceId}`);
+        ws.send(JSON.stringify({ type: 'registered', deviceId: registeredDeviceId }));
+        return;
+      }
+
+      if (data.type === 'response' && data.messageId) {
+        const pending = pendingRequests.get(data.messageId);
+        if (pending) {
+          pending.resolve(data);
+          clearTimeout(pending.timeout);
+          pendingRequests.delete(data.messageId);
+        }
+      }
+    } catch (e) {
+      console.error('[WS] Error processing message:', e);
     }
-    next();
+  });
+
+  ws.on('close', () => {
+    if (registeredDeviceId) {
+      androidDevices.delete(registeredDeviceId);
+      console.log(`[WS] Android device disconnected: ${registeredDeviceId}`);
+    }
+  });
 });
 
-const server = createServer(app);
-const wss = new WebSocketServer({ noServer: true });
-
-// Active connections
-const browsers = new Map(); // deviceId -> WebSocket connection
-const pendingRequests = new Map(); // messageId -> { resolve, reject, timeout }
-
-// Logging system
-const logs = [];
-function addLog(sessionId, clientName, deviceId, action, status, details) {
-    const logEntry = {
-        id: randomUUID().substring(0, 8),
-        timestamp: new Date().toLocaleTimeString('tr-TR'),
-        sessionId: sessionId ? sessionId.substring(0, 8) : 'N/A',
-        clientName: clientName || 'N/A',
-        deviceId: deviceId || 'Varsayılan',
-        action,
-        status, // 'success', 'error', 'pending', 'info'
-        details: details || ''
-    };
-    logs.unshift(logEntry);
-    if (logs.length > 100) {
-        logs.pop();
+function sendCommandToDevice(deviceId, commandType, params = {}) {
+  return new Promise((resolve, reject) => {
+    const ws = androidDevices.get(deviceId || 'android_default') || androidDevices.values().next().value;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return reject(new Error('Android cihazı bağlı değil. Lütfen uygulamayı açın ve MCP bağlantısını başlatın.'));
     }
+
+    const messageId = 'msg_' + Math.random().toString(36).substring(2, 9);
+    const timeout = setTimeout(() => {
+      pendingRequests.delete(messageId);
+      reject(new Error('Android cihazından 30 saniye boyunca yanıt alınamadı.'));
+    }, 30000);
+
+    pendingRequests.set(messageId, { resolve, reject, timeout });
+
+    ws.send(JSON.stringify({
+      type: commandType,
+      messageId,
+      ...params
+    }));
+  });
 }
 
-// Standard MCP Tools schema
-const TOOLS = [
-    {
-        name: "browser_navigate",
-        description: "Android tarayıcısında belirtilen web adresine (URL) gider.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                url: { type: "string", description: "Gidilecek URL (örn. https://www.google.com)" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel, tek cihaz varsa otomatik seçilir)" }
-            },
-            required: ["url"]
-        }
-    },
-    {
-        name: "browser_search",
-        description: "Google'da belirtilen anahtar kelimelerle arama yapar ve arama sonuçları sayfasını yükler.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                query: { type: "string", description: "Google'da aranacak kelime veya cümle (örn. 'en ucuz uçak bileti')" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            },
-            required: ["query"]
-        }
-    },
-    {
-        name: "browser_get_html",
-        description: "Şu an açık olan sayfanın saf HTML kaynağını (`html`), sayfa URL'sini ve sayfa başlığını alır.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
-    },
-    {
-        name: "browser_get_local_markdown",
-        description: "Şu an açık olan sayfanın yerel dahili dönüştürücüsü (Built-in Turndown JS Engine) ile dönüştürülmüş Markdown içeriğini (`markdown`) alır. Crawl4AI sunucusuna istek atmadan doğrudan yerel ve hızlı dönüşüm yapar.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
-    },
-    {
-        name: "browser_get_markdown",
-        description: "Şu an açık olan sayfanın resmi Python Crawl4AI motoru ile işlenmiş fit_markdown/Markdown içeriğini (`markdown`), kullanılan motor bilgisini (`engine_used`) ve dönüştürme durumunu (`markdown_status`) alır.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
-    },
-    {
-        name: "browser_scroll",
-        description: "Sayfayı yukarı veya aşağı kaydırır.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                direction: { type: "string", enum: ["up", "down"], description: "Kaydırma yönü ('up' veya 'down', varsayılan 'down')" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
-    },
-    {
-        name: "browser_click",
-        description: "Belirtilen element ID sayısı (örn. '1' veya '5'), Vimium etiketi, CSS seçici veya metin ('text=Uçuş Ara') ile eşleşen öğeye tıklar.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                selector: { type: "string", description: "Tıklanacak elementin ID sayısı (örn. '1'), Vimium etiketi, CSS seçicisi veya metni (örn. 'text=Arama Yap')" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            },
-            required: ["selector"]
-        }
-    },
-    {
-        name: "browser_execute_js",
-        description: "Sayfada özel bir JavaScript kodu çalıştırır ve sonucunu döner.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                script: { type: "string", description: "Çalıştırılacak JS kod satırı" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            },
-            required: ["script"]
-        }
-    },
-    {
-        name: "browser_type",
-        description: "Belirtilen input/text/tarih alanına yazı girer. Selector olarak element ID sayısı (örn. '2'), Vimium ID sayısı veya CSS seçici kullanılabilir.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                selector: { type: "string", description: "Yazı girilecek elementin ID sayısı (örn. '2') veya CSS seçicisi" },
-                text: { type: "string", description: "Girilecek metin veya tarih (örn. 'İstanbul' veya '2026-08-15')" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            },
-            required: ["selector", "text"]
-        }
-    },
-    {
-        name: "browser_toggle_overlay",
-        description: "Ekrandaki interaktif elementlerin üzerine Vimium-style görsel numaralandırma etiketleri (overlay) ekler veya kaldırır.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                enabled: { type: "boolean", description: "Overlay açık (true) veya kapalı (false) olsun" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            },
-            required: ["enabled"]
-        }
-    },
-    {
-        name: "browser_screenshot",
-        description: "Şu an açık olan tarayıcı ekranının görüntüsünü (screenshot) alır. AI vision modelleri için son derece kullanışlıdır.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                tabId: { type: "string", description: "Hedef sekme ID'si (opsiyonel)" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
-    },
-    {
-        name: "browser_new_tab",
-        description: "Mevcut AI oturumunda yeni bir sekme açar.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                url: { type: "string", description: "Açılacak URL adresi (opsiyonel, varsayılan google.com)" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
-    },
-    {
-        name: "browser_close_tab",
-        description: "Mevcut AI oturumunda bir sekkeyi veya aktif sekkeyi kapatır.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                tabId: { type: "string", description: "Kapatılacak sekme ID'si (opsiyonel, belirtilmezse aktif sekme kapatılır)" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
-    },
-    {
-        name: "browser_list_tabs",
-        description: "Bu AI oturumuna ait tüm açık sekmeleri listeler.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
-    },
-    {
-        name: "browser_switch_tab",
-        description: "Belirtilen sekmeye geçiş yapar.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                tabId: { type: "string", description: "Geçiş yapılacak sekme ID'si" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            },
-            required: ["tabId"]
-        }
-    },
-    {
-        name: "browser_get_session_info",
-        description: "Mevcut tarayıcı oturumunun ve profilinin bilgilerini (Oturum ID, Güvenlik Token'ı, Çerez Durumu, İstemci Adı ve Sekme Sayısı) getirir.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
-    },
-    {
-        name: "browser_switch_session",
-        description: "Belirtilen hedef AI veya kişisel oturuma geçiş yapar. Farklı bir AI oturumuna dönmek veya kişisel oturuma geçmek için kullanılır.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                targetSessionId: { type: "string", description: "Geçilmek istenen oturum ID'si (örn. 'ai_session_cursor', 'personal_browser')" },
-                sessionToken: { type: "string", description: "Güvenlik token'ı (opsiyonel)" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            },
-            required: ["targetSessionId"]
-        }
-    },
-    {
-        name: "browser_clear_session_data",
-        description: "Mevcut veya belirtilen tarayıcı oturumunun çerezlerini, önbelleğini ve gezinti geçmişini temizler.",
-        inputSchema: {
-            type: "object",
-            properties: {
-                targetSessionId: { type: "string", description: "Temizlenecek oturum ID'si (opsiyonel, belirtilmezse mevcut oturum)" },
-                clearCookies: { type: "boolean", description: "Çerezleri sil (Varsayılan: true)" },
-                clearCache: { type: "boolean", description: "Önbelleği sil (Varsayılan: true)" },
-                clearHistory: { type: "boolean", description: "Geçmişi sil (Varsayılan: true)" },
-                deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            }
-        }
+// --- MCP TOOLS (BROWSER + DEVICE) ---
+const MCP_TOOLS = [
+  // 🌐 BROWSER TOOLS
+  {
+    name: 'browser_navigate',
+    description: 'Android WebView tarayıcısında belirtilen URL adresine gider.',
+    inputSchema: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'Açılacak web sitesi URL adresi' } },
+      required: ['url']
     }
+  },
+  {
+    name: 'browser_click',
+    description: 'Aktif web sayfasındaki bir HTML öğesine tıklar.',
+    inputSchema: {
+      type: 'object',
+      properties: { selector: { type: 'string', description: 'CSS seçici' } },
+      required: ['selector']
+    }
+  },
+  {
+    name: 'browser_type',
+    description: 'Aktif web sayfasındaki bir input kutusuna metin yazar.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS seçici' },
+        text: { type: 'string', description: 'Yazılacak metin' }
+      },
+      required: ['selector', 'text']
+    }
+  },
+  {
+    name: 'browser_scroll',
+    description: 'Web sayfasını yukarı veya aşağı kaydırır.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] },
+        amount: { type: 'integer' }
+      }
+    }
+  },
+  {
+    name: 'browser_get_html',
+    description: 'Sayfanın optimize edilmiş HTML içeriğini döker.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'browser_get_markdown',
+    description: 'Sayfanın temizlenmiş Markdown içeriğini döker.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'browser_screenshot',
+    description: 'Aktif tarayıcı sekmesinin Base64 ekran görüntüsünü çeker.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'browser_execute_js',
+    description: 'Web sayfasında JavaScript kodu çalıştırır.',
+    inputSchema: {
+      type: 'object',
+      properties: { script: { type: 'string', description: 'JS kodu' } },
+      required: ['script']
+    }
+  },
+  {
+    name: 'browser_new_tab',
+    description: 'Yeni bir tarayıcı sekmesi açar.',
+    inputSchema: {
+      type: 'object',
+      properties: { url: { type: 'string' } }
+    }
+  },
+  {
+    name: 'browser_switch_tab',
+    description: 'Belirtilen sekmeye geçiş yapar.',
+    inputSchema: {
+      type: 'object',
+      properties: { tabId: { type: 'string' } },
+      required: ['tabId']
+    }
+  },
+  {
+    name: 'browser_close_tab',
+    description: 'Belirtilen tarayıcı sekmesini kapatır.',
+    inputSchema: {
+      type: 'object',
+      properties: { tabId: { type: 'string' } },
+      required: ['tabId']
+    }
+  },
+  {
+    name: 'browser_list_tabs',
+    description: 'Açık olan tüm sekmeleri listeler.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+
+  // 📱 ANDROID CİHAZ & SHIZUKU TOOLS
+  {
+    name: 'get_device_ui',
+    description: 'Açık olan Android uygulamasının (WhatsApp, Ayarlar vb.) buton, metin ve koordinat ağacını sıkıştırılmış Markdown olarak döker.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'device_action',
+    description: 'Android cihazda tıklama, metin yazma, kaydırma, tuşa basma veya uygulama başlatma eylemlerini yürütür.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['click', 'type', 'swipe', 'key_press', 'open_app', 'stop_app'],
+          description: 'Eylem türü'
+        },
+        x: { type: 'integer', description: 'Tıklanacak X koordinatı' },
+        y: { type: 'integer', description: 'Tıklanacak Y koordinatı' },
+        text: { type: 'string', description: 'Yazılacak metin' },
+        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Kaydırma yönü' },
+        distance: { type: 'integer', description: 'Kaydırma pikseli' },
+        key: { type: 'string', enum: ['HOME', 'BACK', 'ENTER', 'APP_SWITCH', 'POWER', 'VOLUME_UP', 'VOLUME_DOWN'], description: 'Sistem tuşu' },
+        app: { type: 'string', description: 'Uygulama paket adı (örn: com.whatsapp)' }
+      },
+      required: ['action']
+    }
+  },
+  {
+    name: 'run_shizuku_cmd',
+    description: 'Shizuku / ADB yetkileriyle doğrudan Android Shell komutu koşturur.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Çalıştırılacak shell komutu' }
+      },
+      required: ['command']
+    }
+  }
 ];
 
-// Helper to find connected browser with sticky session-to-device binding
-const sessionDeviceBindings = new Map(); // sessionId -> { boundDeviceId, lastToolCallTime }
-
-function getBrowserWsForSession(sessionId = 'default_session', requestedDeviceId = null) {
-    const now = Date.now();
-    const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 dakikalık inaktivite zaman aşımı
-
-    let binding = sessionDeviceBindings.get(sessionId);
-
-    // İnaktivite süresi dolduysa eşleşmeyi temizle
-    if (binding && (now - binding.lastToolCallTime > INACTIVITY_TIMEOUT_MS)) {
-        console.log(`[MCP] Oturum '${sessionId}' için cihaz eşleşmesi ('${binding.boundDeviceId}') 30 dk inaktivite sonrası sıfırlandı.`);
-        sessionDeviceBindings.delete(sessionId);
-        binding = null;
-    }
-
-    // 1. AI açıkça online olan geçerli bir deviceId talep ettiyse onu kullan ve eşleştir
-    if (requestedDeviceId && browsers.has(requestedDeviceId)) {
-        const ws = browsers.get(requestedDeviceId);
-        if (ws && ws.readyState === 1) { // 1 = OPEN
-            sessionDeviceBindings.set(sessionId, { boundDeviceId: requestedDeviceId, lastToolCallTime: now });
-            return { ws, deviceId: requestedDeviceId };
-        }
-        browsers.delete(requestedDeviceId);
-    }
-
-    // 2. Bu oturumun aktif ve hâlâ online olan sabit (sticky) bir bağlı cihazı var mı kontrol et
-    if (binding && binding.boundDeviceId && browsers.has(binding.boundDeviceId)) {
-        const boundWs = browsers.get(binding.boundDeviceId);
-        if (boundWs && boundWs.readyState === 1) {
-            binding.lastToolCallTime = now;
-            return { ws: boundWs, deviceId: binding.boundDeviceId };
-        }
-        console.log(`[MCP] Bağlı cihaz '${binding.boundDeviceId}' koptu. '${sessionId}' oturumuna yeni cihaz atanacak.`);
-        sessionDeviceBindings.delete(sessionId);
-    }
-
-    // 3. AI eski/offline bir deviceId istedi veya oturum henüz bir cihaza bağlı değil:
-    // Bağlı ilk aktif Android cihazını seç ve bu oturuma sabitle!
-    for (const [id, ws] of browsers.entries()) {
-        if (ws && ws.readyState === 1) {
-            sessionDeviceBindings.set(sessionId, { boundDeviceId: id, lastToolCallTime: now });
-            console.log(`[MCP] Oturum '${sessionId}' için aktif Android cihazı eşleştirildi: '${id}'`);
-            return { ws, deviceId: id };
-        } else {
-            browsers.delete(id);
-        }
-    }
-
-    return { ws: null, deviceId: null };
-}
-
-// Helper to route command to Android browser and await result
-function routeCommandToBrowser(type, args, targetDeviceId, sessionId = 'default_session', clientName = 'Yapay Zeka', token = '') {
-    return new Promise((resolve, reject) => {
-        const { ws, deviceId } = getBrowserWsForSession(sessionId, targetDeviceId);
-        if (!ws) {
-            return reject(new Error("Bağlı aktif bir Android tarayıcı bulunamadı. Lütfen uygulamanın açık ve köprüye bağlı olduğundan emin olun."));
-        }
-
-        const messageId = randomUUID();
-        const payload = JSON.stringify({
-            type,
-            messageId,
-            sessionId,
-            clientName,
-            token,
-            ...args
-        });
-
-        const timeout = setTimeout(() => {
-            pendingRequests.delete(messageId);
-            reject(new Error(`Android cihazından (${deviceId}) yanıt alınamadı, zaman aşımı (15s).`));
-        }, 15000);
-
-        pendingRequests.set(messageId, { 
-            resolve: (val) => {
-                // Attach assigned deviceId to response object
-                if (val && typeof val === 'object' && !Array.isArray(val)) {
-                    val.deviceId = deviceId;
-                }
-                resolve(val);
-            }, 
-            reject, 
-            timeout 
-        });
-        ws.send(payload);
-        console.log(`[Bridge] Sent command '${type}' (Session: ${sessionId}, Client: ${clientName}, TargetDevice: ${deviceId}) with ID: ${messageId}`);
-    });
-}
-
-// Upgrade HTTP to WebSocket for Android app connection
-server.on('upgrade', (request, socket, head) => {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-    });
-});
-
-// WebSocket Server Handler (for Android App)
-wss.on('connection', (ws) => {
-    let clientDeviceId = null;
-    console.log("[WS] New connection attempt...");
-
-    ws.on('message', (message) => {
-        try {
-            const payload = JSON.parse(message.toString());
-            console.log(`[WS] Received:`, payload);
-
-            if (payload.type === 'register') {
-                clientDeviceId = payload.deviceId || `device_${Math.floor(Math.random() * 10000)}`;
-                const existingWs = browsers.get(clientDeviceId);
-                if (existingWs && existingWs !== ws) {
-                    console.log(`[WS] Replacing existing connection for device: ${clientDeviceId}`);
-                    try { existingWs.close(1000, "Replaced by new connection"); } catch (e) {}
-                }
-                browsers.set(clientDeviceId, ws);
-                console.log(`[WS] Android device successfully registered: ${clientDeviceId}`);
-                addLog(null, 'Android Uygulaması', clientDeviceId, 'Cihaz Bağlantısı', 'success', 'Cihaz köprüye başarıyla bağlandı ve kullanıma hazır.');
-                
-                // Send confirmation
-                ws.send(JSON.stringify({
-                    type: "register_ack",
-                    messageId: payload.messageId || "0",
-                    deviceId: clientDeviceId,
-                    status: "success"
-                }));
-            } else if (payload.type === 'ping') {
-                if (payload.deviceId) {
-                    clientDeviceId = payload.deviceId;
-                    if (browsers.get(clientDeviceId) !== ws) {
-                        browsers.set(clientDeviceId, ws);
-                        console.log(`[WS] Re-bound active socket for device: ${clientDeviceId}`);
-                    }
-                }
-                ws.send(JSON.stringify({
-                    type: "pong",
-                    deviceId: clientDeviceId,
-                    timestamp: Date.now()
-                }));
-            } else if (payload.type === 'response') {
-                const { messageId, status, success, data, error } = payload;
-                const pending = pendingRequests.get(messageId);
-                if (pending) {
-                    clearTimeout(pending.timeout);
-                    pendingRequests.delete(messageId);
-                    if (status === 'success' || success === true) {
-                        pending.resolve(data || {});
-                    } else {
-                        pending.reject(new Error(error || "Cihaz işlem hatası"));
-                    }
-                }
-            }
-        } catch (err) {
-            console.error("[WS] Error parsing message:", err);
-        }
-    });
-
-    ws.on('close', () => {
-        if (clientDeviceId) {
-            // ONLY delete from browsers map if THIS exact socket is still the registered active socket!
-            if (browsers.get(clientDeviceId) === ws) {
-                browsers.delete(clientDeviceId);
-                console.log(`[WS] Android device disconnected: ${clientDeviceId}`);
-                addLog(null, 'Android Uygulaması', clientDeviceId, 'Cihaz Ayrıldı', 'info', 'Cihaz bağlantıyı kapattı.');
-            } else {
-                console.log(`[WS] Stale closed socket cleaned up for device: ${clientDeviceId} (active socket preserved)`);
-            }
-        }
-    });
-
-    ws.on('error', (err) => {
-        console.error(`[WS] Connection error for ${clientDeviceId || 'unknown'}:`, err);
-    });
-});
-
-// Server-side keepalive ping every 15s to keep proxy connections active
-setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (ws.readyState === 1) { // 1 = OPEN
-            try {
-                ws.ping();
-            } catch (e) {}
-        }
-    });
-}, 15000);
-
-// ----------------------------------------------------
-// 1. STANDARD MCP SSE TRANSPORT ENDPOINTS
-// ----------------------------------------------------
-const sseSessions = new Map(); // sessionId -> { res, clientInfo }
-
-// Helper to send JSON-RPC response or notification to the MCP client over the active SSE stream
-function sendSseJsonRpc(sessionId, jsonRpcMessage) {
-    const session = sseSessions.get(sessionId);
-    const res = session ? session.res : null;
-    if (res) {
-        console.log(`[SSE] Sending JSON-RPC response to session ${sessionId}:`, JSON.stringify(jsonRpcMessage));
-        res.write(`event: message\ndata: ${JSON.stringify(jsonRpcMessage)}\n\n`);
-        return true;
-    } else {
-        console.error(`[SSE] Error: Active session not found for ${sessionId}`);
-        return false;
-    }
-}
-
-function extractBearerToken(req) {
-    const authHeader = req.headers['authorization'] || req.headers['Authorization'] || '';
-    if (authHeader) {
-        if (authHeader.toLowerCase().startsWith('bearer ')) {
-            return authHeader.substring(7).trim();
-        }
-        return authHeader.trim();
-    }
-    return req.query.token || req.query.profileId || req.query.bearer || req.headers['x-mcp-token'] || req.headers['x-api-key'] || '';
-}
-
-app.get('/sse', (req, res) => {
-    const reqToken = extractBearerToken(req);
-    const reqClientName = req.query.clientName || req.query.name || req.query.agentName || '';
-
-    let sessionId = req.query.sessionId;
-    if (!sessionId) {
-        if (reqToken) {
-            const cleanToken = reqToken.replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
-            sessionId = `token_${cleanToken}`;
-        } else if (reqClientName) {
-            sessionId = `client_${reqClientName.toLowerCase().replace(/[^a-z0-9_]/g, '_')}`;
-        } else {
-            sessionId = `ai_session_${randomUUID().substring(0, 8)}`;
-        }
-    }
-    
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache, no-transform',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'
-    });
-
-    // Send initial comment/heartbeat to establish connection immediately and bypass buffers
-    res.write(':\n\n');
-
-    // Keep SSE alive with heartbeats
-    const heartbeatInterval = setInterval(() => {
-        res.write(':\n\n');
-    }, 15000);
-
-    sseSessions.set(sessionId, { res, clientInfo: { name: reqClientName || 'İstemci Doğrulanıyor' }, token: reqToken, clientName: reqClientName });
-    console.log(`[MCP] SSE Session created: ${sessionId} (Client: ${reqClientName || 'N/A'}, Token: ${reqToken ? reqToken.substring(0, 10) + '...' : 'NONE'})`);
-    addLog(sessionId, reqClientName || 'Bağlanıyor', null, 'SSE Bağlantısı', 'info', `İstemci SSE kanalı üzerinden bağlantı başlattı. Token: ${reqToken || 'Yok'}`);
-
-    // Construct ABSOLUTE POST URL for MCP client to avoid relative path resolution bugs in clients like Cursor/Claude Desktop
-    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-    const host = req.headers['host'] || 'localhost:10000';
-    const postUrl = `${protocol}://${host}/message?sessionId=${sessionId}`;
-
-    console.log(`[MCP] Sending SSE endpoint redirect URL: ${postUrl}`);
-    res.write(`event: endpoint\ndata: ${postUrl}\n\n`);
-
-    req.on('close', () => {
-        clearInterval(heartbeatInterval);
-        const session = sseSessions.get(sessionId);
-        const clientName = session ? (session.clientName || (session.clientInfo ? session.clientInfo.name : 'N/A')) : 'N/A';
-        sseSessions.delete(sessionId);
-        console.log(`[MCP] SSE Session closed: ${sessionId}`);
-        addLog(sessionId, clientName, null, 'Bağlantı Kesildi', 'info', 'SSE kanalı kapatıldı.');
-    });
-});
-
-// Post endpoint for standard MCP client
-app.post('/message', async (req, res) => {
-    let { sessionId } = req.query;
-    const reqToken = extractBearerToken(req);
-
-    if (!sessionId && reqToken) {
-        const cleanToken = reqToken.replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
-        sessionId = `token_${cleanToken}`;
-    }
-
-    const rpcRequest = req.body;
-
-    console.log(`[MCP] Incoming JSON-RPC Request (Session: ${sessionId}, Token: ${reqToken || 'N/A'}):`, JSON.stringify(rpcRequest));
-
-    if (!sessionId) {
-        return res.status(400).json({ error: "Missing sessionId or Authorization token" });
-    }
-
-    if (!rpcRequest || typeof rpcRequest !== 'object') {
-        const errorResponse = { jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null };
-        sendSseJsonRpc(sessionId, errorResponse);
-        return res.status(200).send("accepted");
-    }
-
-    const { method, params, id } = rpcRequest;
-
-    // Handle notifications (no response required in JSON-RPC, return 202 immediately)
-    if (id === undefined || id === null) {
-        console.log(`[MCP] Received Notification: ${method}`);
-        if (method === 'notifications/initialized') {
-            console.log(`[MCP] Handshake completed successfully! Session: ${sessionId}`);
-            const session = sseSessions.get(sessionId);
-            if (session && session.clientInfo) {
-                addLog(sessionId, session.clientName || session.clientInfo.name, null, 'Sistem Hazır', 'success', 'MCP Handshake başarıyla tamamlandı. İstemci hazır.');
-            }
-        }
-        return res.status(202).send("accepted");
-    }
-
-    // Helper to send JSON-RPC formatted responses
-    const reply = (result, error = null) => {
-        const payload = { jsonrpc: "2.0", id };
-        if (error) {
-            payload.error = error;
-        } else {
-            payload.result = result;
-        }
-        sendSseJsonRpc(sessionId, payload);
-    };
-
-    // 1. Handle initialize handshake (CRITICAL for clients like Cursor / Claude Desktop)
-    if (method === 'initialize') {
-        const clientInfo = params?.clientInfo || { name: 'Belirtilmeyen Yapay Zeka' };
-        const session = sseSessions.get(sessionId);
-        if (session) {
-            session.clientInfo = clientInfo;
-            if (clientInfo.name && clientInfo.name !== 'Belirtilmeyen Yapay Zeka') {
-                session.clientName = clientInfo.name;
-            }
-        }
-        addLog(sessionId, clientInfo.name, null, 'Başlatma Handshake', 'success', `Yapay zeka asistanı bağlandı: ${clientInfo.name} (v${clientInfo.version || 'unknown'}).`);
-
-        reply({
-            protocolVersion: params?.protocolVersion || "2024-11-05",
-            capabilities: {
-                tools: {} // We support tools
-            },
-            serverInfo: {
-                name: "mcp-android-bridge",
-                version: "1.0.0"
-            }
-        });
-        return res.status(200).send("accepted");
-    }
-
-    // 2. Handle ping
-    if (method === 'ping') {
-        reply({});
-        return res.status(200).send("accepted");
-    }
-
-    // 3. Handle tools list
-    if (method === 'tools/list') {
-        reply({ tools: TOOLS });
-        return res.status(200).send("accepted");
-    }
-
-    // 4. Handle tools execution
-    if (method === 'tools/call') {
-        const toolName = params?.name;
-        const args = params?.arguments || {};
-        const deviceId = args.deviceId;
-
-        // Strip deviceId from args to avoid passing it to WebView
-        const cleanArgs = { ...args };
-        delete cleanArgs.deviceId;
-
-        let actionType = "";
-        switch (toolName) {
-            case "browser_navigate": actionType = "navigate"; break;
-            case "browser_search": actionType = "search"; break;
-            case "browser_get_html": actionType = "get_html"; break;
-            case "browser_get_local_markdown": actionType = "get_local_markdown"; break;
-            case "browser_get_markdown": 
-            case "browser_get_crawl4ai_markdown": actionType = "get_markdown"; break;
-            case "browser_scroll": actionType = "scroll"; break;
-            case "browser_click": actionType = "click"; break;
-            case "browser_type": actionType = "type"; break;
-            case "browser_toggle_overlay": actionType = "toggle_overlay"; break;
-            case "browser_screenshot": actionType = "screenshot"; break;
-            case "browser_execute_js": actionType = "execute_js"; break;
-            case "browser_new_tab": actionType = "new_tab"; break;
-            case "browser_close_tab": actionType = "close_tab"; break;
-            case "browser_list_tabs": actionType = "list_tabs"; break;
-            case "browser_switch_tab": actionType = "switch_tab"; break;
-            case "browser_get_session_info": actionType = "get_session_info"; break;
-            case "browser_switch_session": actionType = "switch_session_mcp"; break;
-            case "browser_clear_session_data": actionType = "clear_session_data"; break;
-            default:
-                reply(null, { code: -32601, message: `Tool not found: ${toolName}` });
-                return res.status(200).send("accepted");
-        }
-
-        const session = sseSessions.get(sessionId);
-        const clientName = (session && session.clientName) ? session.clientName : 
-                           (session && session.clientInfo && session.clientInfo.name) ? session.clientInfo.name : 
-                           req.query.clientName || 'Yapay Zeka';
-        const token = (session && session.token) ? session.token : 
-                      req.query.token || req.query.profileId || '';
-
-        try {
-            const { deviceId: resolvedDeviceId } = getBrowserWsForSession(sessionId, deviceId);
-            addLog(sessionId, clientName, resolvedDeviceId || deviceId || 'Varsayılan Cihaz', `Araç Çağrısı: ${toolName}`, 'pending', `Komut gönderiliyor. Parametreler: ${JSON.stringify(cleanArgs)}`);
-            let responseData = await routeCommandToBrowser(actionType, cleanArgs, deviceId, sessionId, clientName, token);
-            responseData = await processCrawl4AIEngine(toolName, responseData, req.headers, sessionId, clientName, deviceId);
-
-            let details = "Komut başarıyla yürütüldü.";
-            if ((toolName === "browser_get_markdown" || toolName === "browser_get_crawl4ai_markdown" || toolName === "get_markdown") && responseData.markdown) {
-                details = `[Motor: ${responseData.engine_used}] Crawl4AI Markdown verisi alındı (${responseData.markdown.length} karakter).`;
-            } else if ((toolName === "browser_get_local_markdown" || toolName === "get_local_markdown") && responseData.markdown) {
-                details = `[Motor: ${responseData.engine_used}] Yerel Markdown verisi alındı (${responseData.markdown.length} karakter).`;
-            } else if ((toolName === "browser_get_html" || toolName === "get_html") && responseData.html) {
-                details = `HTML kaynağı alındı (${responseData.html.length} karakter).`;
-            } else if (toolName === "browser_navigate" && responseData.url) {
-                details = `Adrese yönlendirildi: ${responseData.url}`;
-            } else if (toolName === "browser_search" && responseData.url) {
-                details = `Google araması yapıldı, yönlendirilen URL: ${responseData.url}`;
-            } else {
-                details = `Yanıt: ${JSON.stringify(responseData)}`;
-            }
-
-            addLog(sessionId, clientName, deviceId || 'Varsayılan Cihaz', `Yürütme Başarılı: ${toolName}`, 'success', details);
-
-            const content = [];
-            
-            if (responseData && responseData.screenshot) {
-                const screenshotBase64 = responseData.screenshot;
-                
-                // Keep the JSON response clean by removing the massive base64 string from text output
-                const cleanResponseData = { ...responseData };
-                delete cleanResponseData.screenshot;
-                
-                content.push({
-                    type: "text",
-                    text: JSON.stringify(cleanResponseData, null, 2)
-                });
-                
-                content.push({
-                    type: "image",
-                    data: screenshotBase64,
-                    mimeType: "image/jpeg"
-                });
-            } else {
-                content.push({
-                    type: "text",
-                    text: JSON.stringify(responseData, null, 2)
-                });
-            }
-
-            reply({ content });
-        } catch (error) {
-            addLog(sessionId, clientName, deviceId || 'Varsayılan Cihaz', `Hata: ${toolName}`, 'error', error.message);
-            reply({
-                isError: true,
-                content: [
-                    {
-                        type: "text",
-                        text: `Hata: ${error.message}`
-                    }
-                ]
-            });
-        }
-        return res.status(200).send("accepted");
-    }
-
-    // Default response for other unhandled methods
-    reply({});
-    return res.status(200).send("accepted");
-});
-
-function extractMarkdownFromCrawlResponse(obj) {
-    if (!obj) return null;
-    
-    if (typeof obj === 'string') {
-        const trimmed = obj.trim();
-        if (trimmed && trimmed !== "None" && !trimmed.startsWith('<!DOCTYPE') && !trimmed.startsWith('<html')) {
-            return trimmed;
-        }
-        return null;
-    }
-
-    if (typeof obj !== 'object') return null;
-
-    // 1. Direct priority keys
-    const priorityKeys = ['fit_markdown', 'markdown', 'raw_markdown', 'citations_markdown', 'content_markdown'];
-    for (const key of priorityKeys) {
-        if (obj[key]) {
-            const sub = extractMarkdownFromCrawlResponse(obj[key]);
-            if (sub) return sub;
-        }
-    }
-
-    // 2. Look inside 'results', 'result', 'data', 'items' arrays or objects
-    const containers = ['results', 'result', 'data', 'items'];
-    for (const containerKey of containers) {
-        const val = obj[containerKey];
-        if (Array.isArray(val) && val.length > 0) {
-            for (const item of val) {
-                const sub = extractMarkdownFromCrawlResponse(item);
-                if (sub) return sub;
-            }
-        } else if (val && typeof val === 'object') {
-            const sub = extractMarkdownFromCrawlResponse(val);
-            if (sub) return sub;
-        } else if (typeof val === 'string') {
-            const sub = extractMarkdownFromCrawlResponse(val);
-            if (sub) return sub;
-        }
-    }
-
-    // 3. Look at generic string keys
-    const textKeys = ['content', 'text', 'cleaned_html', 'md'];
-    for (const key of textKeys) {
-        if (obj[key]) {
-            const sub = extractMarkdownFromCrawlResponse(obj[key]);
-            if (sub) return sub;
-        }
-    }
-
-    return null;
-}
-
-async function processCrawl4AIEngine(toolName, responseData, reqHeaders = {}, sessionId = null, clientName = null, deviceId = null) {
-    if (!responseData) return responseData;
-
-    // Capture initial fallback markdown from Android local JS engine
-    const fallbackMarkdown = responseData.markdown || responseData.turndown_markdown || responseData.custom_markdown || "";
-
-    // 1. LOCAL MARKDOWN TOOL (browser_get_local_markdown)
-    if (toolName === "browser_get_local_markdown" || toolName === "get_local_markdown") {
-        responseData.markdown = fallbackMarkdown;
-        responseData.engine_used = "Built-in Turndown JS Engine (Local)";
-        responseData.markdown_status = "SUCCESS (Built-in Turndown JS Engine)";
-
-        delete responseData.turndown_markdown;
-        delete responseData.custom_markdown;
-        delete responseData.crawl4ai_markdown;
-        delete responseData.fit_markdown;
-        delete responseData.raw_markdown;
-        delete responseData.html;
-        delete responseData.raw_html;
-
-        return responseData;
-    }
-
-    // 2. HTML TOOL (browser_get_html)
-    if (toolName === "browser_get_html" || toolName === "get_html") {
-        responseData.markdown = fallbackMarkdown;
-        responseData.engine_used = "Built-in Turndown JS Engine (Local)";
-        delete responseData.turndown_markdown;
-        delete responseData.custom_markdown;
-        delete responseData.crawl4ai_markdown;
-        delete responseData.fit_markdown;
-        delete responseData.raw_markdown;
-        delete responseData.raw_html;
-
-        return responseData;
-    }
-
-    // 3. CRAWL4AI MARKDOWN TOOL (browser_get_markdown / browser_get_crawl4ai_markdown)
-    const isCrawlTool = (toolName === "browser_get_markdown" || toolName === "browser_get_crawl4ai_markdown" || toolName === "get_markdown");
-
-    let crawlError = null;
-    let convertedMarkdown = null;
-
-    const targetUrl = (process.env.CRAWL4AI_API_URL || '').trim();
-
-    if (isCrawlTool) {
-        if (!targetUrl) {
-            console.log(`[Crawl4AI] CRAWL4AI_API_URL is NOT configured in environment. Using local Turndown JS fallback engine.`);
-        } else if (responseData.html || responseData.raw_html || responseData.url) {
-            try {
-                const fullRawHtml = responseData.raw_html || responseData.html || '';
-                
-                // Look for token across environment variables or incoming MCP headers
-                const incomingAuth = reqHeaders ? (reqHeaders['authorization'] || reqHeaders['Authorization'] || reqHeaders['x-crawl4ai-token'] || reqHeaders['x-api-key']) : null;
-                const rawToken = process.env.CRAWL4AI_API_TOKEN || process.env.CRAWL4AI_TOKEN || incomingAuth;
-                
-                let cleanToken = "";
-                if (rawToken) {
-                    cleanToken = String(rawToken).trim().replace(/^Bearer\s+/i, '');
-                }
-
-                const maskedToken = cleanToken ? `${cleanToken.substring(0, 4)}***` : 'NONE';
-                console.log(`[Crawl4AI] Initiating Crawl4AI Engine Request:
-  -> URL: ${targetUrl}
-  -> Page HTML Length: ${fullRawHtml.length} chars
-  -> Page URL: ${responseData.url || 'N/A'}
-  -> Auth Token: ${maskedToken}`);
-
-                addLog(sessionId, clientName, deviceId, 'Crawl4AI İsteği', 'info', `Crawl4AI sunucusuna (${targetUrl}) ${fullRawHtml.length} karakter HTML gönderiliyor... (Token: ${maskedToken})`);
-
-                const crawlHeaders = { 
-                    'Content-Type': 'application/json',
-                    'Bypass-Tunnel-Reminder': 'true',
-                    'User-Agent': 'MCP-Server/1.0'
-                };
-
-                if (cleanToken) {
-                    crawlHeaders['Authorization'] = `Bearer ${cleanToken}`;
-                    crawlHeaders['X-API-Key'] = cleanToken;
-                }
-
-                const pageUrl = (responseData.url && typeof responseData.url === 'string' && responseData.url.trim().length > 0)
-                    ? responseData.url.trim()
-                    : 'https://browser.page';
-
-                const requestBody = {
-                    urls: [pageUrl],
-                    url: pageUrl,
-                    html: fullRawHtml,
-                    raw_html: fullRawHtml,
-                    word_count_threshold: 10,
-                    api_key: cleanToken,
-                    token: cleanToken
-                };
-
-                const crawlRes = await fetch(targetUrl, {
-                    method: 'POST',
-                    headers: crawlHeaders,
-                    signal: AbortSignal.timeout(20000), // 20 seconds timeout
-                    body: JSON.stringify(requestBody)
-                });
-
-                console.log(`[Crawl4AI] HTTP Response Received: Status ${crawlRes.status} ${crawlRes.statusText}`);
-
-                if (crawlRes.ok) {
-                    const crawlJson = await crawlRes.json();
-                    const authenticMarkdown = extractMarkdownFromCrawlResponse(crawlJson);
-                    
-                    if (authenticMarkdown && authenticMarkdown.length > 0) {
-                        console.log(`[Crawl4AI] SUCCESS: Received official Crawl4AI markdown (${authenticMarkdown.length} chars)!`);
-                        convertedMarkdown = authenticMarkdown;
-                        responseData.engine_used = "Official Crawl4AI Python Engine";
-                        responseData.markdown_status = "SUCCESS (Official Crawl4AI Python Engine)";
-                        addLog(sessionId, clientName, deviceId, 'Crawl4AI Başarılı', 'success', `Official Crawl4AI Python Engine ile ${authenticMarkdown.length} karakter markdown üretildi.`);
-                    } else {
-                        const jsonSnippet = JSON.stringify(crawlJson).substring(0, 200);
-                        console.warn(`[Crawl4AI] WARNING: Could not parse markdown from Crawl4AI response: ${jsonSnippet}`);
-                        crawlError = `Crawl4AI response body format not recognized: ${jsonSnippet}`;
-                        addLog(sessionId, clientName, deviceId, 'Crawl4AI Yanıt Format Hatası', 'error', `Yanıt 200 OK döndü ancak Markdown çıkarılamadı: ${jsonSnippet}`);
-                    }
-                } else {
-                    const errText = await crawlRes.text().catch(() => '');
-                    console.error(`[Crawl4AI] ERROR: Service returned HTTP ${crawlRes.status}: ${errText}`);
-                    crawlError = `HTTP ${crawlRes.status}: ${errText}`;
-                    addLog(sessionId, clientName, deviceId, 'Crawl4AI Hatası', 'error', `HTTP ${crawlRes.status} Hatası: ${errText}`);
-                }
-            } catch (c4err) {
-                console.error(`[Crawl4AI] EXCEPTION during Crawl4AI request: ${c4err.message}`);
-                crawlError = `Exception: ${c4err.message}`;
-                addLog(sessionId, clientName, deviceId, 'Crawl4AI Bağlantı Hatası', 'error', `İstek başarısız: ${c4err.message}`);
-            }
-        }
-    }
-
-    // Set single primary markdown field & status information
-    if (convertedMarkdown) {
-        responseData.markdown = convertedMarkdown;
-    } else {
-        if (isCrawlTool) {
-            /* 
-            // YEDEK/FALLBACK MEKANİZMASI (Pasife alındı)
-            responseData.markdown = fallbackMarkdown;
-            responseData.engine_used = "Built-in Turndown JS Engine (Local Fallback)";
-            if (crawlError) {
-                responseData.markdown_status = `FALLBACK: Built-in Turndown JS Engine (Crawl4AI Error: ${crawlError})`;
-            } else if (!targetUrl) {
-                responseData.markdown_status = "FALLBACK: Built-in Turndown JS Engine (CRAWL4AI_API_URL not set in Render environment)";
-            } else {
-                responseData.markdown_status = "FALLBACK: Built-in Turndown JS Engine (Crawl4AI returned empty response)";
-            }
-            */
-            responseData.markdown = `Crawl4AI bağlantı başarısız oldu veya dönüşüm yapılamadı.\n\nHata detayı: ${crawlError || 'CRAWL4AI_API_URL eksik veya geçersiz.'}\n\nLütfen yerel çevirimi kullanmak için 'browser_get_local_markdown' aracını çağırın.`;
-            responseData.engine_used = "Crawl4AI Python Engine (FAILED)";
-            responseData.markdown_status = "FAILED";
-        } else {
-            responseData.markdown = fallbackMarkdown;
-        }
-    }
-
-    // CLEANUP: Remove duplicate and redundant fields to avoid confusion for AI client
-    delete responseData.turndown_markdown;
-    delete responseData.custom_markdown;
-    delete responseData.crawl4ai_markdown;
-    delete responseData.fit_markdown;
-    delete responseData.raw_markdown;
-    delete responseData.raw_html;
-
-    if (isCrawlTool) {
-        delete responseData.html;
-    }
-
-    return responseData;
-}
-
-// ----------------------------------------------------
-// 2. DIRECT REST FALLBACK API ENDPOINTS
-// ----------------------------------------------------
-const directToolHandler = async (type, req, res) => {
-    const args = req.method === 'POST' ? req.body : req.query;
-    const deviceId = args.deviceId;
-    
-    const cleanArgs = { ...args };
-    delete cleanArgs.deviceId;
-
-    console.log(`[REST API] Direct request for '${type}':`, cleanArgs);
+// --- MCP SSE Server Transport ---
+let sseTransport = null;
+
+app.get('/sse', async (req, res) => {
+  console.log('[SSE] New MCP client connected');
+  sseTransport = new SSEServerTransport('/messages', res);
+  
+  const mcpServer = new Server(
+    { name: 'android-browser-bridge-mcp', version: '2.0.0' },
+    { capabilities: { tools: {} } }
+  );
+
+  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
+    return { tools: MCP_TOOLS };
+  });
+
+  mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    console.log(`[MCP] Tool invoked: ${name}`, args);
 
     try {
-        addLog(null, 'REST Fallback API', deviceId || 'Varsayılan Cihaz', `Direct API: ${type}`, 'pending', `Parametreler: ${JSON.stringify(cleanArgs)}`);
-        let responseData = await routeCommandToBrowser(type, cleanArgs, deviceId);
-        responseData = await processCrawl4AIEngine(type, responseData, req.headers, null, 'REST API', deviceId);
-        addLog(null, 'REST Fallback API', deviceId || 'Varsayılan Cihaz', `Direct API Başarılı: ${type}`, 'success', `Yanıt boyutu: ${JSON.stringify(responseData).length} karakter. Motor: ${responseData.engine_used || 'varsayılan'}`);
-        return res.json({ status: "success", data: responseData });
-    } catch (error) {
-        addLog(null, 'REST Fallback API', deviceId || 'Varsayılan Cihaz', `Direct API Hatası: ${type}`, 'error', error.message);
-        return res.status(500).json({ status: "error", error: error.message });
+      let result;
+      if (name.startsWith('browser_')) {
+        const cmdType = name.replace('browser_', '');
+        result = await sendCommandToDevice(args?.deviceId, cmdType === 'get_html' ? 'get_html' : cmdType, args);
+      } else if (name === 'get_device_ui') {
+        result = await sendCommandToDevice(args?.deviceId, 'get_device_ui', {});
+      } else if (name === 'device_action') {
+        result = await sendCommandToDevice(args?.deviceId, 'device_action', args);
+      } else if (name === 'run_shizuku_cmd') {
+        result = await sendCommandToDevice(args?.deviceId, 'run_shizuku_cmd', { cmd: args?.command });
+      } else {
+        throw new Error(`Bilinmeyen araç: ${name}`);
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: typeof result?.data === 'string' ? result.data : JSON.stringify(result?.data || result, null, 2)
+          }
+        ]
+      };
+    } catch (err) {
+      console.error(`[MCP] Error running tool ${name}:`, err);
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Hata: ${err.message}` }]
+      };
     }
-};
+  });
 
-// Map both GET, POST, and PUT to avoid 404s no matter what the client uses!
-const fallbackRoutes = [
-    { path: '/mcp/tools/browser_navigate', type: 'navigate' },
-    { path: '/tools/browser_navigate', type: 'navigate' },
-    
-    { path: '/mcp/tools/browser_search', type: 'search' },
-    { path: '/tools/browser_search', type: 'search' },
-    
-    { path: '/mcp/tools/browser_get_html', type: 'get_html' },
-    { path: '/tools/browser_get_html', type: 'get_html' },
-    
-    { path: '/mcp/tools/browser_get_local_markdown', type: 'get_local_markdown' },
-    { path: '/tools/browser_get_local_markdown', type: 'get_local_markdown' },
-    
-    { path: '/mcp/tools/browser_get_markdown', type: 'get_markdown' },
-    { path: '/tools/browser_get_markdown', type: 'get_markdown' },
-    { path: '/mcp/tools/browser_get_crawl4ai_markdown', type: 'get_markdown' },
-    { path: '/tools/browser_get_crawl4ai_markdown', type: 'get_markdown' },
-    
-    { path: '/mcp/tools/browser_scroll', type: 'scroll' },
-    { path: '/tools/browser_scroll', type: 'scroll' },
-    
-    { path: '/mcp/tools/browser_click', type: 'click' },
-    { path: '/tools/browser_click', type: 'click' },
-    
-    { path: '/mcp/tools/browser_type', type: 'type' },
-    { path: '/tools/browser_type', type: 'type' },
-
-    { path: '/mcp/tools/browser_toggle_overlay', type: 'toggle_overlay' },
-    { path: '/tools/browser_toggle_overlay', type: 'toggle_overlay' },
-    
-    { path: '/mcp/tools/browser_screenshot', type: 'screenshot' },
-    { path: '/tools/browser_screenshot', type: 'screenshot' },
-    
-    { path: '/mcp/tools/browser_execute_js', type: 'execute_js' },
-    { path: '/tools/browser_execute_js', type: 'execute_js' }
-];
-
-fallbackRoutes.forEach(route => {
-    app.all(route.path, (req, res) => {
-        directToolHandler(route.type, req, res);
-    });
+  await mcpServer.connect(sseTransport);
 });
 
-// JSON API Status endpoint for Live updates
-app.get('/api/status', (req, res) => {
-    const sessions = Array.from(sseSessions.entries()).map(([id, session]) => ({
-        id: id,
-        clientName: session.clientInfo?.name || 'MCP Client'
-    }));
-    res.json({
-        status: "running",
-        connected_browsers: Array.from(browsers.keys()),
-        active_sse_sessions_count: sseSessions.size,
-        active_sse_sessions: sessions,
-        logs: logs
-    });
+app.post('/messages', async (req, res) => {
+  if (sseTransport) {
+    await sseTransport.handlePostMessage(req, res);
+  } else {
+    res.status(400).send('No active SSE connection');
+  }
 });
 
-// Information root endpoint
+// --- Orijinal Temiz Web Paneli ---
 app.get('/', (req, res) => {
-    res.send(`
-<!DOCTYPE html>
-<html lang="tr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MCP Android Browser Bridge Server</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-    <style>
-        body {
-            font-family: 'Plus Jakarta Sans', sans-serif;
-            background-color: #0b1120;
-            color: #f3f4f6;
-        }
-        .code-font {
-            font-family: 'JetBrains Mono', monospace;
-        }
-        .glow-indigo {
-            box-shadow: 0 0 25px rgba(99, 102, 241, 0.15);
-        }
-        .glow-terminal {
-            box-shadow: inset 0 0 15px rgba(0, 0, 0, 0.6);
-        }
-    </style>
-</head>
-<body class="min-h-screen flex flex-col justify-between selection:bg-indigo-500 selection:text-white">
+  const activeDeviceCount = androidDevices.size;
+  const deviceList = Array.from(androidDevices.keys()).join(', ') || 'Hiçbir cihaz bağlı değil';
 
-    <!-- Header / Navbar -->
-    <header class="border-b border-slate-800/80 bg-slate-900/40 backdrop-blur sticky top-0 z-50 px-6 py-4">
-        <div class="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-4">
-            <div class="flex items-center gap-3">
-                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-                    <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                    </svg>
-                </div>
-                <div>
-                    <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
-                        Android MCP Bridge Console
-                        <span class="px-2 py-0.5 text-[10px] font-semibold tracking-wider text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 rounded-full uppercase">Aktif</span>
-                    </h1>
-                    <p class="text-xs text-slate-400">Model Context Protocol (MCP) için Gerçek Zamanlı İzleme Paneli</p>
-                </div>
-            </div>
-            <div class="flex items-center gap-3">
-                <a href="/sse" target="_blank" class="px-4 py-2 text-xs font-semibold text-indigo-400 hover:text-white bg-indigo-500/10 hover:bg-indigo-500/20 border border-indigo-500/20 hover:border-indigo-500/40 rounded-xl transition duration-200">
-                    SSE Bağlantısını Test Et
-                </a>
-            </div>
-        </div>
-    </header>
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="tr">
+    <head>
+      <meta charset="UTF-8">
+      <title>Android Browser & Device MCP Server</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 2rem; background: #f8fafc; color: #1e293b; max-width: 800px; margin: 0 auto; line-height: 1.5; }
+        h1 { color: #0f172a; border-bottom: 2px solid #e2e8f0; padding-bottom: 0.5rem; }
+        .status { padding: 1rem; border-radius: 8px; margin: 1.5rem 0; background: ${activeDeviceCount > 0 ? '#dcfce7' : '#fee2e2'}; border: 1px solid ${activeDeviceCount > 0 ? '#86efac' : '#fca5a5'}; }
+        .code { background: #1e293b; color: #f8fafc; padding: 1rem; border-radius: 8px; font-family: monospace; overflow-x: auto; margin: 1rem 0; }
+        ul { padding-left: 1.5rem; }
+        li { margin-bottom: 0.4rem; }
+        .badge { background: #e0f2fe; color: #0369a1; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-family: monospace; }
+        .device-badge { background: #dcfce7; color: #15803d; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-family: monospace; }
+      </style>
+    </head>
+    <body>
+      <h1>🌐 Android Browser & Device MCP Server</h1>
+      <p>Bu sunucu, Android cihazınız ile Yapay Zeka (Cursor / Claude / Windsurf) arasında MCP köprüsü kurar.</p>
+      
+      <div class="status">
+        <strong>Bağlı Cihaz Sayısı:</strong> ${activeDeviceCount}<br>
+        <strong>Aktif Cihazlar:</strong> ${deviceList}
+      </div>
 
-    <!-- Main Content Grid -->
-    <main class="max-w-7xl mx-auto w-full px-6 py-8 flex-grow grid grid-cols-1 lg:grid-cols-12 gap-8">
-        
-        <!-- Left Side: System Metrics & Connections (5 Columns) -->
-        <div class="lg:col-span-5 flex flex-col gap-6">
-            
-            <!-- Connection Status Panel -->
-            <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-6 glow-indigo relative overflow-hidden">
-                <div class="absolute top-0 right-0 w-32 h-32 bg-indigo-600/10 rounded-full blur-3xl"></div>
-                
-                <h2 class="text-xs font-bold tracking-wider uppercase text-slate-400 mb-6 flex items-center gap-2">
-                    <span class="w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></span>
-                    Sistem Metrikleri
-                </h2>
-                
-                <!-- Server Metrics -->
-                <div class="grid grid-cols-2 gap-4 relative z-10">
-                    <div class="bg-slate-950/40 border border-slate-800/80 rounded-xl p-4">
-                        <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-1 font-semibold">Bağlı Android Cihazları</div>
-                        <div class="flex items-baseline gap-1.5">
-                            <span id="browser-count" class="text-3xl font-extrabold text-white">0</span>
-                            <span class="text-xs text-slate-400 font-medium">cihaz</span>
-                        </div>
-                    </div>
-                    
-                    <div class="bg-slate-950/40 border border-slate-800/80 rounded-xl p-4">
-                        <div class="text-[10px] text-slate-500 uppercase tracking-wider mb-1 font-semibold">Aktif İşlemciler (AI)</div>
-                        <div class="flex items-baseline gap-1.5">
-                            <span id="sse-count" class="text-3xl font-extrabold text-indigo-400">0</span>
-                            <span class="text-xs text-slate-400 font-medium">istemci</span>
-                        </div>
-                    </div>
-                </div>
+      <h2>🔌 MCP İstemci Yapılandırması (SSE)</h2>
+      <div class="code">{
+  "mcpServers": {
+    "android-mcp": {
+      "url": "https://${req.headers.host || 'mcp-browser-1.onrender.com'}/sse"
+    }
+  }
+}</div>
 
-                <!-- Live device list -->
-                <div class="mt-6 pt-5 border-t border-slate-800">
-                    <h3 class="text-xs font-bold tracking-wider uppercase text-slate-400 mb-3 flex items-center gap-2">
-                        <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
-                        </svg>
-                        Bağlı Aktif Cihazlar
-                    </h3>
-                    <div id="device-list" class="space-y-2">
-                        <div class="text-xs text-slate-500 italic py-2">Hiçbir cihaz bağlı değil. Android uygulamasından köprüye bağlanın.</div>
-                    </div>
-                </div>
+      <h2>🛠️ Desteklenen MCP Araçları (Tools)</h2>
+      
+      <h3>🌐 Tarayıcı Araçları (Browser)</h3>
+      <ul>
+        <li><span class="badge">browser_navigate</span> - Web sitesine gider.</li>
+        <li><span class="badge">browser_click</span> - Sayfadaki öğeye tıklar.</li>
+        <li><span class="badge">browser_type</span> - Metin kutusuna yazı yazar.</li>
+        <li><span class="badge">browser_scroll</span> - Sayfayı kaydırır.</li>
+        <li><span class="badge">browser_get_html</span> - Sayfanın HTML/Markdown kodunu döker.</li>
+        <li><span class="badge">browser_get_markdown</span> - Sayfanın temizlenmiş Markdown içeriğini döker.</li>
+        <li><span class="badge">browser_screenshot</span> - Tarayıcının ekran görüntüsünü çeker.</li>
+        <li><span class="badge">browser_execute_js</span> - Özel JavaScript kodu çalıştırır.</li>
+        <li><span class="badge">browser_new_tab</span> - Yeni sekme açar.</li>
+        <li><span class="badge">browser_switch_tab</span> - Sekmeler arası geçiş yapar.</li>
+        <li><span class="badge">browser_close_tab</span> - Sekmeyi kapatır.</li>
+        <li><span class="badge">browser_list_tabs</span> - Tüm açık sekmeleri listeler.</li>
+      </ul>
 
-                <!-- Active AI Processors List -->
-                <div class="mt-6 pt-5 border-t border-slate-800">
-                    <h3 class="text-xs font-bold tracking-wider uppercase text-slate-400 mb-3 flex items-center gap-2">
-                        <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                        </svg>
-                        Aktif İşlemciler (AI İstemcileri)
-                    </h3>
-                    <div id="processor-list" class="space-y-2">
-                        <div class="text-xs text-slate-500 italic py-2">Aktif yapay zeka oturumu bulunmuyor.</div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Client Configuration Helper -->
-            <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-6">
-                <h2 class="text-xs font-bold tracking-wider uppercase text-slate-400 mb-4">MCP İstemci Kurulumu</h2>
-                <p class="text-xs text-slate-400 mb-4 leading-relaxed">
-                    Yapay zeka asistanınızı (Cursor, Claude Desktop, Windsurf, vb.) bu köprüye bağlamak için aşağıdaki SSE adresini kullanın:
-                </p>
-                
-                <div class="bg-slate-950 border border-slate-800/80 rounded-xl p-3 mb-4 flex items-center justify-between gap-2 overflow-hidden">
-                    <span id="sse-url-text" class="text-xs text-indigo-300 code-font truncate select-all"></span>
-                    <button onclick="copySseUrl()" class="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[10px] font-bold transition flex-shrink-0">
-                        Kopyala
-                    </button>
-                </div>
-
-                <div class="space-y-2.5 text-xs text-slate-400 leading-relaxed">
-                    <div class="flex gap-2">
-                        <span class="text-indigo-400 font-bold">1.</span>
-                        <span>Cursor / Windsurf <b>Settings -> MCP</b> sayfasına gidin.</span>
-                    </div>
-                    <div class="flex gap-2">
-                        <span class="text-indigo-400 font-bold">2.</span>
-                        <span>Yeni bir MCP Server ekleyin, tipini <b>SSE</b> olarak seçin.</span>
-                    </div>
-                    <div class="flex gap-2">
-                        <span class="text-indigo-400 font-bold">3.</span>
-                        <span>URL kısmına yukarıdaki adresi yapıştırın.</span>
-                    </div>
-                </div>
-            </div>
-
-        </div>
-
-        <!-- Right Side: Live Logs & Available tools (7 Columns) -->
-        <div class="lg:col-span-7 flex flex-col gap-6">
-            
-            <!-- Live Activity Console (LOGS) -->
-            <div class="bg-slate-900/60 border border-slate-800 rounded-2xl p-6 flex flex-col h-[400px] overflow-hidden">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-xs font-bold tracking-wider uppercase text-slate-400 flex items-center gap-2">
-                        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
-                        Canlı İşlem Logları (Log Stream)
-                    </h2>
-                    <span class="text-[10px] code-font text-slate-500 px-2 py-0.5 bg-slate-950 rounded-md">Realtime Polling</span>
-                </div>
-                
-                <!-- Terminal Style Log Display -->
-                <div id="terminal" class="bg-slate-950 rounded-xl border border-slate-800/80 p-4 font-mono text-[11px] text-slate-300 flex-grow overflow-y-auto space-y-2.5 glow-terminal">
-                    <!-- Log entries loaded dynamically -->
-                    <div class="text-slate-500 italic">Sistem logları yükleniyor...</div>
-                </div>
-            </div>
-
-            <!-- List of Supported Tools -->
-            <div class="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-6">
-                <h3 class="text-xs font-bold tracking-wider uppercase text-slate-400 mb-4">Desteklenen MCP Araçları (Tools)</h3>
-                
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    ${TOOLS.map(tool => `
-                        <div class="bg-slate-900/60 border border-slate-800/80 hover:border-slate-700 rounded-xl p-4 transition flex flex-col justify-between">
-                            <div>
-                                <div class="flex justify-between items-center mb-2">
-                                    <span class="px-2 py-0.5 bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded text-[10px] code-font font-semibold">
-                                        ${tool.name}
-                                    </span>
-                                </div>
-                                <p class="text-[11px] text-slate-300 leading-relaxed">${tool.description}</p>
-                            </div>
-                        </div>
-                    `).join('')}
-                </div>
-            </div>
-
-        </div>
-
-    </main>
-
-    <!-- Footer -->
-    <footer class="border-t border-slate-800/60 bg-slate-950/60 px-6 py-6 text-center text-xs text-slate-500">
-        <div class="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-4">
-            <p>© 2026 MCP Android Browser Bridge Server. Tüm hakları saklıdır.</p>
-            <p>Durum güncellemeleri ve işlem logları anlık olarak otomatik yenilenir.</p>
-        </div>
-    </footer>
-
-    <!-- Script for Live Status Polling -->
-    <script>
-        // Set dynamic SSE URL
-        const secureProtocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
-        const sseUrl = \`\${secureProtocol}//\${window.location.host}/sse\`;
-        document.getElementById('sse-url-text').textContent = sseUrl;
-
-        function copySseUrl() {
-            navigator.clipboard.writeText(sseUrl);
-            alert("SSE Bağlantı Adresi Başarıyla Kopyalandı!");
-        }
-
-        // Cache last logs to avoid unnecessary DOM updates
-        let lastLogIdHash = "";
-
-        async function updateStatus() {
-            try {
-                const response = await fetch('/api/status');
-                if (!response.ok) return;
-                const data = await response.json();
-                
-                // Update Counts
-                document.getElementById('browser-count').textContent = data.connected_browsers.length;
-                document.getElementById('sse-count').textContent = data.active_sse_sessions_count;
-                
-                // Update connected devices list
-                const deviceListDiv = document.getElementById('device-list');
-                if (data.connected_browsers.length === 0) {
-                    deviceListDiv.innerHTML = \`<div class="text-xs text-slate-500 italic py-2">Hiçbir cihaz bağlı değil. Android uygulamasından köprüye bağlanın.</div>\`;
-                } else {
-                    deviceListDiv.innerHTML = data.connected_browsers.map(deviceId => \`
-                        <div class="flex items-center justify-between bg-slate-950 border border-slate-800/80 px-3 py-2 rounded-xl">
-                            <span class="text-xs text-slate-300 code-font font-medium">\${deviceId}</span>
-                            <span class="flex h-2 w-2 relative">
-                                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                                <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                            </span>
-                        </div>
-                    \`).join('');
-                }
-
-                // Update active processors list
-                const processorListDiv = document.getElementById('processor-list');
-                if (!data.active_sse_sessions || data.active_sse_sessions.length === 0) {
-                    processorListDiv.innerHTML = \`<div class="text-xs text-slate-500 italic py-2">Aktif yapay zeka oturumu bulunmuyor.</div>\`;
-                } else {
-                    processorListDiv.innerHTML = data.active_sse_sessions.map(session => \`
-                        <div class="flex items-center justify-between bg-slate-950 border border-slate-800/80 px-3 py-2 rounded-xl">
-                            <div class="flex flex-col">
-                                <span class="text-xs text-indigo-300 font-semibold">\${session.clientName}</span>
-                                <span class="text-[9px] text-slate-500 code-font">Session: \${session.id.substring(0, 8)}</span>
-                            </div>
-                            <span class="flex h-1.5 w-1.5 relative">
-                                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-                                <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-indigo-500"></span>
-                            </span>
-                        </div>
-                    \`).join('');
-                }
-
-                // Render Logs
-                const logHash = data.logs.map(l => l.id).join(',');
-                if (logHash !== lastLogIdHash) {
-                    lastLogIdHash = logHash;
-                    const terminal = document.getElementById('terminal');
-                    if (!data.logs || data.logs.length === 0) {
-                        terminal.innerHTML = \`<div class="text-slate-500 italic">Henüz bir işlem gerçekleştirilmedi.</div>\`;
-                    } else {
-                        terminal.innerHTML = data.logs.map(log => {
-                            let statusColor = "text-slate-400";
-                            let statusBadge = "[INFO]";
-                            
-                            if (log.status === 'success') {
-                                statusColor = "text-emerald-400";
-                                statusBadge = "[OK]";
-                            } else if (log.status === 'error') {
-                                statusColor = "text-red-400 font-bold animate-pulse";
-                                statusBadge = "[FAIL]";
-                            } else if (log.status === 'pending') {
-                                statusColor = "text-amber-400";
-                                statusBadge = "[PENDING]";
-                            }
-                            
-                            return \`
-                                <div class="pb-2 border-b border-slate-900/60 last:border-0 last:pb-0">
-                                    <div class="flex items-center gap-2 text-[10px]">
-                                        <span class="text-slate-500">[\${log.timestamp}]</span>
-                                        <span class="\${statusColor} font-bold">\${statusBadge}</span>
-                                        <span class="text-indigo-300 font-semibold">\${log.clientName}</span>
-                                        <span class="text-slate-400">-></span>
-                                        <span class="text-slate-400 font-medium">\${log.deviceId}</span>
-                                    </div>
-                                    <div class="text-white font-medium mt-0.5 text-xs">\${log.action}</div>
-                                    \${log.details ? \`<div class="text-slate-400 text-[10px] mt-0.5 leading-relaxed bg-slate-950/80 p-1.5 rounded border border-slate-900/80 code-font overflow-x-auto">\${log.details}</div>\` : ''}
-                                </div>
-                            \`;
-                        }).join('');
-                    }
-                }
-            } catch (err) {
-                console.error("Status update error:", err);
-            }
-        }
-
-        // Poll status every 2 seconds
-        updateStatus();
-        setInterval(updateStatus, 2000);
-    </script>
-</body>
-</html>
-    `);
+      <h3 style="margin-top: 1.5rem; color: #15803d;">📱 Android Cihaz & Shizuku Araçları (Device)</h3>
+      <ul>
+        <li><span class="device-badge">get_device_ui</span> - Açık olan Android uygulamasının ekran UI buton ve metin ağacını koordinatlarıyla döker.</li>
+        <li><span class="device-badge">device_action</span> - Android cihazda tıklama, metin yazma, kaydırma, sistem tuşuna basma veya uygulama açma eylemlerini yürütür.</li>
+        <li><span class="device-badge">run_shizuku_cmd</span> - Shizuku / ADB yetkileriyle doğrudan Android Shell terminal komutu koşturur.</li>
+      </ul>
+    </body>
+    </html>
+  `);
 });
 
-// OAuth 2.0 & Claude Web Connector Auto-Registration Support
-app.get(['/.well-known/oauth-authorization-server', '/.well-known/openid-configuration', '/.well-known/mcp-configuration'], (req, res) => {
-    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-    const host = req.headers['host'] || 'mcp-browser-1.onrender.com';
-    const baseUrl = `${protocol}://${host}`;
-
-    res.json({
-        issuer: baseUrl,
-        authorization_endpoint: `${baseUrl}/oauth/authorize`,
-        token_endpoint: `${baseUrl}/oauth/token`,
-        registration_endpoint: `${baseUrl}/oauth/register`,
-        response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code"],
-        code_challenge_methods_supported: ["S256", "plain"],
-        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"]
-    });
-});
-
-app.post(['/oauth/register', '/register'], (req, res) => {
-    res.json({
-        client_id: "mcp_auto_client_id",
-        client_secret: "mcp_auto_client_secret",
-        client_id_issued_at: Math.floor(Date.now() / 1000),
-        client_secret_expires_at: 0,
-        redirect_uris: req.body?.redirect_uris || ["https://claude.ai/oauth/callback"]
-    });
-});
-
-app.get(['/oauth/authorize', '/authorize'], (req, res) => {
-    const redirectUri = req.query.redirect_uri || req.query.redirect_url || 'https://claude.ai/oauth/callback';
-    const state = req.query.state || '';
-    const code = 'mcp_auto_code_' + randomUUID().substring(0, 8);
-    
-    const targetUrl = new URL(redirectUri);
-    targetUrl.searchParams.set('code', code);
-    if (state) targetUrl.searchParams.set('state', state);
-
-    console.log(`[OAuth] Auto-approving OAuth authorize request for Claude Web -> Redirecting to ${targetUrl.toString()}`);
-    return res.redirect(targetUrl.toString());
-});
-
-app.post(['/oauth/token', '/token'], (req, res) => {
-    res.json({
-        access_token: "mcp_auto_access_token",
-        token_type: "Bearer",
-        expires_in: 31536000,
-        scope: "mcp"
-    });
-});
-
-// Start listening
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => {
-    console.log(`=================================================`);
-    console.log(` MCP Bridge Server is running on port ${PORT}`);
-    console.log(` - Root Endpoint: http://localhost:${PORT}/`);
-    console.log(` - Standard MCP SSE: http://localhost:${PORT}/sse`);
-    console.log(` - Connected Devices Count: ${browsers.size}`);
-    console.log(`=================================================`);
+httpServer.listen(PORT, () => {
+  console.log(`[HTTP/WS] Server listening on port ${PORT}`);
+  console.log(`[MCP] SSE endpoint available at /sse`);
 });
