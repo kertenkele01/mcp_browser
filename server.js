@@ -47,8 +47,26 @@ function addLog(sessionId, clientName, deviceId, action, status, details) {
 // Standard MCP Tools schema
 const TOOLS = [
     {
+        name: "browser_get_tool_documentation",
+        description: "Android Tarayıcı MCP Köprüsündeki tüm araçların (tools) detaylı kullanım kılavuzunu, parametrelerini, örnek çağrılarını ve en iyi ajansal iş akışlarını (Agent Best Practices / Playbooks) döner. Bir aracın nasıl çalıştığını öğrenmek veya karmaşık web otomasyon adımlarını planlamak için bu aracı çağırın.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                tool_name: { 
+                    type: "string", 
+                    description: "Hakkında detaylı bilgi ve örnek iş akışı istenen aracın adı (örn. 'browser_get_markdown', 'browser_click', 'browser_type', 'browser_search', 'browser_navigate', 'all'). Boş bırakılırsa tüm araçların tam rehberini döner." 
+                },
+                category: { 
+                    type: "string", 
+                    enum: ["all", "navigation", "interaction", "content_extraction", "tabs_and_sessions", "meta"],
+                    description: "Araç kategorisine göre filtreleme ('all', 'navigation', 'interaction', 'content_extraction', 'tabs_and_sessions', 'meta')" 
+                }
+            }
+        }
+    },
+    {
         name: "browser_navigate",
-        description: "Android tarayıcısında belirtilen web adresine (URL) gider.",
+        description: "Android tarayıcısında belirtilen web adresine (URL) gider. Ayrıntılı kılavuz için 'browser_get_tool_documentation' aracını inceleyin.",
         inputSchema: {
             type: "object",
             properties: {
@@ -253,6 +271,288 @@ const TOOLS = [
         }
     }
 ];
+
+// Comprehensive Tool Documentation & Agent Playbooks Dictionary
+const TOOL_DOCUMENTATION = {
+    overview: {
+        title: "Android Tarayıcı MCP Köprüsü - AI Ajanı Kullanım Rehberi (Agent Playbook & Skills)",
+        description: "Bu sistem, gerçek bir Android cihazı üzerindeki donanım hızlandırmalı WebView ile çalışan yüksek performanslı Model Context Protocol (MCP) köprüsüdür. Yapay zeka ajanları gerçek tarayıcı ortamında arama yapabilir, sayfaları okuyabilir, form doldurabilir, butonlara tıklayabilir, sekme ve izole oturum yönetimi gerçekleştirebilir.",
+        capabilities: [
+            "Gerçek Android WebView ortamında tam JavaScript, DOM, CSS ve Canvas çalıştırma",
+            "Multi-Profile Cookie İzolasyonu: Her AI istemcisine özel bağımsız çerez ve depolama alanı",
+            "Crawl4AI & Dahili Turndown Markdown Motorları ile anında temiz içerik çıkarma",
+            "Vimium-Style Numaralandırılmış Görsel Overlay ile elementleri ID sayılarıyla seçme/tıklama",
+            "Çoklu Sekme (Multi-Tab) ve Çoklu Oturum (Multi-Session) yönetimi",
+            "Ekran görüntüsü (Screenshot) ve DOM kaynağı alma"
+        ],
+        meta_tool_note: "İstediğiniz zaman 'browser_get_tool_documentation' aracını çağırarak spesifik bir araç veya kategori hakkında detaylı kılavuz alabilirsiniz."
+    },
+    categories: {
+        navigation: {
+            name: "Sayfa Gezinme & Arama",
+            tools: ["browser_navigate", "browser_search", "browser_scroll"]
+        },
+        interaction: {
+            name: "Etkileşim, Tıklama & Form Doldurma",
+            tools: ["browser_click", "browser_type", "browser_toggle_overlay", "browser_execute_js"]
+        },
+        content_extraction: {
+            name: "İçerik Okuma & Görsel Alma",
+            tools: ["browser_get_markdown", "browser_get_local_markdown", "browser_get_html", "browser_screenshot"]
+        },
+        tabs_and_sessions: {
+            name: "Sekme & Profil/Oturum Yönetimi",
+            tools: ["browser_new_tab", "browser_close_tab", "browser_list_tabs", "browser_switch_tab", "browser_get_session_info", "browser_switch_session", "browser_clear_session_data"]
+        },
+        meta: {
+            name: "Rehber & Dokümantasyon",
+            tools: ["browser_get_tool_documentation"]
+        }
+    },
+    tools: {
+        browser_get_tool_documentation: {
+            name: "browser_get_tool_documentation",
+            category: "meta",
+            summary: "Tüm MCP araçlarının parametrelerini, kullanım şekillerini, örneklerini ve en iyi iş akışlarını döner.",
+            parameters: {
+                tool_name: "(Opsiyonel, String) Hakkında bilgi istenen aracın adı (örn. 'browser_click', 'browser_get_markdown', 'browser_type', 'all'). Boş bırakılırsa tüm araçların rehberi döner.",
+                category: "(Opsiyonel, String) Kategori filtresi ('navigation', 'interaction', 'content_extraction', 'tabs_and_sessions', 'meta', 'all')."
+            },
+            best_practice: "Yeni bir göreve başlarken hangi araçları nasıl kombine edeceğinizi planlamak veya parametre isimlerini doğrulamak için ilk olarak bu aracı çağırın."
+        },
+        browser_navigate: {
+            name: "browser_navigate",
+            category: "navigation",
+            summary: "Belirtilen web adresine (URL) gider ve sayfanın yüklenmesini başlatır.",
+            parameters: {
+                url: "(Zorunlu, String) Gidilecek tam web adresi (örn. 'https://en.wikipedia.org' veya 'https://news.ycombinator.com'). Her zaman protokolü (https://) ekleyin.",
+                deviceId: "(Opsiyonel, String) Hedef Android cihaz ID'si."
+            },
+            example_call: { url: "https://www.google.com" },
+            best_practice: "Gezinti sonrası içerik okumak için 'browser_get_local_markdown' veya 'browser_get_markdown' aracını çağırın."
+        },
+        browser_search: {
+            name: "browser_search",
+            category: "navigation",
+            summary: "Google'da belirtilen anahtar kelimelerle doğrudan arama yapar.",
+            parameters: {
+                query: "(Zorunlu, String) Aranacak kelime veya cümle (örn. '2026 en iyi yapay zeka modelleri')",
+                deviceId: "(Opsiyonel, String) Hedef Android cihaz ID'si."
+            },
+            example_call: { query: "İstanbul hava durumu" },
+            best_practice: "Google aramasından sonra arama sonuçlarındaki linkleri ve başlıkları okumak için 'browser_get_local_markdown' çağırın."
+        },
+        browser_get_local_markdown: {
+            name: "browser_get_local_markdown",
+            category: "content_extraction",
+            summary: "Açık olan sayfanın yerel dahili Turndown motoruyla anında dönüştürülmüş Markdown içeriğini döner.",
+            parameters: {
+                deviceId: "(Opsiyonel, String) Hedef Android cihaz ID'si."
+            },
+            best_practice: "En hızlı, en hafif ve sıfır gecikmeli içerik okuma aracıdır. Makale okumak, arama sonuçlarını taramak veya sayfa yapısını anlamak için ilk tercihiniz olmalıdır."
+        },
+        browser_get_markdown: {
+            name: "browser_get_markdown",
+            category: "content_extraction",
+            summary: "Sayfanın resmi Crawl4AI Python motoru ile işlenmiş fit_markdown içeriğini döner.",
+            parameters: {
+                deviceId: "(Opsiyonel, String) Hedef Android cihaz ID'si."
+            },
+            best_practice: "Crawl4AI sunucusu aktif olduğunda gereksiz gürültüden arındırılmış temiz metin çıktısı sağlar."
+        },
+        browser_get_html: {
+            name: "browser_get_html",
+            category: "content_extraction",
+            summary: "Sayfanın ham outerHTML kaynağını döner.",
+            parameters: {
+                deviceId: "(Opsiyonel, String) Hedef Android cihaz ID'si."
+            },
+            best_practice: "Spesifik DOM elementlerini, form input id/name etiketlerini veya karmaşık CSS seçicilerini bulmak gerektiğinde kullanın."
+        },
+        browser_screenshot: {
+            name: "browser_screenshot",
+            category: "content_extraction",
+            summary: "Ekranın anlık JPEG görüntüsünü (screenshot) alır.",
+            parameters: {
+                tabId: "(Opsiyonel, String) Hedef sekme ID'si.",
+                deviceId: "(Opsiyonel, String) Hedef Android cihaz ID'si."
+            },
+            best_practice: "Görsel doğrulama yapmak, captcha/grafik incelemek veya kullanıcı arayüzü düzenini görmek için idealdir."
+        },
+        browser_toggle_overlay: {
+            name: "browser_toggle_overlay",
+            category: "interaction",
+            summary: "Ekrandaki tüm interaktif elementlerin üzerine Vimium-style görsel numaralandırma etiketleri ekler/kaldırır.",
+            parameters: {
+                enabled: "(Zorunlu, Boolean) true (etiketleri aç) veya false (kapat)"
+            },
+            best_practice: "Form doldururken veya karmaşık bir sayfada tıklama yaparken önce overlay'i açın, screenshot alın veya element ID sayılarını tespit edip doğrudan ID numarasıyla ('1', '2' vb.) tıklayın."
+        },
+        browser_click: {
+            name: "browser_click",
+            category: "interaction",
+            summary: "Belirtilen element ID numarasına ('1', '5'), CSS seçicisine veya metne ('text=Giriş Yap') tıklar.",
+            parameters: {
+                selector: "(Zorunlu, String) Element ID sayısı (örn. '3'), CSS seçici (örn. '#btn-submit', 'button.primary') veya metin (örn. 'text=Uçuş Ara')"
+            },
+            example_call: { selector: "text=Arama Yap" },
+            best_practice: "Metinle tıklama ('text=...') veya element numarası ile tıklama ('1') genellikle CSS class isimlerinden çok daha dayanıklıdır."
+        },
+        browser_type: {
+            name: "browser_type",
+            category: "interaction",
+            summary: "Input veya metin alanına yazı yazar ve gerçek klavye/input olaylarını tetikler.",
+            parameters: {
+                selector: "(Zorunlu, String) Element ID sayısı (örn. '2'), CSS seçici (örn. 'input[name=\"q\"]') veya 'input'",
+                text: "(Zorunlu, String) Girilecek metin (örn. 'Ali Veli' veya '2026-08-15')"
+            },
+            example_call: { selector: "input[type='search']", text: "Antalya Otelleri" },
+            best_practice: "Yazı yazdıktan sonra formu göndermek için ilgili butona 'browser_click' yapın veya 'browser_execute_js' ile form.submit() tetikleyin."
+        },
+        browser_scroll: {
+            name: "browser_scroll",
+            category: "navigation",
+            summary: "Sayfayı aşağı ('down') veya yukarı ('up') kaydırır.",
+            parameters: {
+                direction: "(Opsiyonel, String) 'down' veya 'up' (Varsayılan: 'down')"
+            },
+            best_practice: "Sonsuz kaydırmalı sayfalarda (Twitter, feed'ler) veya ekranın altında kalan butonları görünür yapmak için kullanın."
+        },
+        browser_execute_js: {
+            name: "browser_execute_js",
+            category: "interaction",
+            summary: "Sayfa bağlamında özel JavaScript kodu çalıştırır ve sonucunu döner.",
+            parameters: {
+                script: "(Zorunlu, String) Çalıştırılacak JS kodu (örn. 'document.title' veya 'window.location.href')"
+            },
+            best_practice: "Özel DOM sorguları, çerez okuma, sayfa içi hesaplamalar veya karmaşık tetikleyiciler için kullanın."
+        },
+        browser_new_tab: {
+            name: "browser_new_tab",
+            category: "tabs_and_sessions",
+            summary: "Mevcut AI oturumunda yeni bir tarayıcı sekmesi açar.",
+            parameters: {
+                url: "(Opsiyonel, String) Açılacak URL adresi (Varsayılan: google.com)"
+            },
+            best_practice: "Mevcut sayfadaki çalışmanızı kaybetmeden yan bir araştırma veya işlem yapmak istediğinizde yeni sekme açın."
+        },
+        browser_close_tab: {
+            name: "browser_close_tab",
+            category: "tabs_and_sessions",
+            summary: "Belirtilen veya aktif olan sekmeyi kapatır.",
+            parameters: {
+                tabId: "(Opsiyonel, String) Kapatılacak sekme ID'si."
+            }
+        },
+        browser_list_tabs: {
+            name: "browser_list_tabs",
+            category: "tabs_and_sessions",
+            summary: "Bu AI oturumuna ait açık tüm sekmeleri başlıkları ve URL'leri ile listeler.",
+            parameters: {}
+        },
+        browser_switch_tab: {
+            name: "browser_switch_tab",
+            category: "tabs_and_sessions",
+            summary: "Belirtilen sekmeye geçiş yapar ve aktif sekme haline getirir.",
+            parameters: {
+                tabId: "(Zorunlu, String) Hedef sekme ID'si."
+            }
+        },
+        browser_get_session_info: {
+            name: "browser_get_session_info",
+            category: "tabs_and_sessions",
+            summary: "Mevcut oturumun ID'sini, güvenlik token'ını, çerez durumunu ve açık sekme sayısını döner.",
+            parameters: {}
+        },
+        browser_switch_session: {
+            name: "browser_switch_session",
+            category: "tabs_and_sessions",
+            summary: "Farklı bir AI oturumuna veya 'personal_browser' oturumuna geçiş yapar.",
+            parameters: {
+                targetSessionId: "(Zorunlu, String) Hedef oturum ID'si."
+            }
+        },
+        browser_clear_session_data: {
+            name: "browser_clear_session_data",
+            category: "tabs_and_sessions",
+            summary: "Belirtilen oturumun çerezlerini, önbelleğini ve gezinti geçmişini temizler.",
+            parameters: {
+                targetSessionId: "(Opsiyonel, String) Hedef oturum ID'si.",
+                clearCookies: "(Opsiyonel, Boolean) Varsayılan: true",
+                clearCache: "(Opsiyonel, Boolean) Varsayılan: true",
+                clearHistory: "(Opsiyonel, Boolean) Varsayılan: true"
+            }
+        }
+    },
+    playbooks: [
+        {
+            title: "İş Akışı 1: Web Araması ve Bilgi Toplama (Research & Extract)",
+            steps: [
+                "1. 'browser_search(query: \"...\")' çağırarak arama yapın.",
+                "2. 'browser_get_local_markdown()' çağırarak arama sonuçlarını ve linkleri okuyun.",
+                "3. İlgili bir sonuca gitmek için 'browser_navigate(url: \"...\")' veya 'browser_click(selector: \"text=...\")' çağırın.",
+                "4. Hedef sayfadaki tam içeriği 'browser_get_local_markdown()' ile çekip kullanıcıya özetleyin."
+            ]
+        },
+        {
+            title: "İş Akışı 2: Form Doldurma ve Buton Tıklama (Form Filling & Automation)",
+            steps: [
+                "1. 'browser_navigate(url: \"...\")' ile sayfayı açın.",
+                "2. 'browser_type(selector: \"input[name='username']\", text: \"...\")' ile inputları doldurun.",
+                "3. Butona tıklamak için 'browser_click(selector: \"text=Giriş Yap\")' veya CSS seçici kullanın.",
+                "4. İşlemin sonucunu doğrulamak için 'browser_get_local_markdown()' veya 'browser_screenshot()' çağırın."
+            ]
+        },
+        {
+            title: "İş Akışı 3: Görsel Destekli Hassas Tıklama (Vision-Assisted Clicking)",
+            steps: [
+                "1. 'browser_toggle_overlay(enabled: true)' ile interaktif elementlerin üzerine numaralandırma etiketlerini yerleştirin.",
+                "2. 'browser_screenshot()' alarak etiket numaralarını görsel olarak inceleyin.",
+                "3. Hedef elementin numarasını (örn. '5') 'browser_click(selector: \"5\")' ile doğrudan tıklayın.",
+                "4. İşi bitirince 'browser_toggle_overlay(enabled: false)' ile overlay'i kapatın."
+            ]
+        },
+        {
+            title: "İş Akışı 4: Paralel Görevler & Sekme İzolasyonu (Multi-Tab Management)",
+            steps: [
+                "1. Mevcut sayfayı bozmamak için 'browser_new_tab(url: \"https://...\")' çağırın.",
+                "2. Yeni sekmede işlemlerinizi yürütün.",
+                "3. İşiniz bittiğinde 'browser_close_tab()' ile kapatın veya 'browser_switch_tab(tabId: \"...\")' ile önceki sekmeye dönün."
+            ]
+        }
+    ]
+};
+
+function generateDocumentationResponse(toolName = 'all', category = 'all') {
+    const cleanTool = (toolName || 'all').trim().toLowerCase();
+    const cleanCat = (category || 'all').trim().toLowerCase();
+
+    if (cleanTool !== 'all' && TOOL_DOCUMENTATION.tools[cleanTool]) {
+        const doc = TOOL_DOCUMENTATION.tools[cleanTool];
+        return {
+            status: "success",
+            requested_tool: cleanTool,
+            documentation: doc,
+            meta_info: "Tüm araçların ve iş akışlarının tam listesini görmek için tool_name: 'all' parametresi ile çağırabilirsiniz.",
+            formatted_text: `### 🛠️ Araç Rehberi: ${doc.name}\n- **Kategori:** ${doc.category}\n- **Özet:** ${doc.summary}\n- **Parametreler:**\n${Object.entries(doc.parameters).map(([k, v]) => `  - \`${k}\`: ${v}`).join('\n')}\n- **En İyi Kullanım (Best Practice):** ${doc.best_practice}\n${doc.example_call ? `- **Örnek Çağrı:** \`${JSON.stringify(doc.example_call)}\`\n` : ''}`
+        };
+    }
+
+    let filteredTools = Object.values(TOOL_DOCUMENTATION.tools);
+    if (cleanCat !== 'all') {
+        filteredTools = filteredTools.filter(t => t.category === cleanCat);
+    }
+
+    return {
+        status: "success",
+        overview: TOOL_DOCUMENTATION.overview,
+        category_filter: cleanCat,
+        total_tools: filteredTools.length,
+        tools: filteredTools,
+        playbooks: TOOL_DOCUMENTATION.playbooks,
+        quick_tip: "Herhangi bir aracın spesifik detayını almak için: browser_get_tool_documentation(tool_name: 'araç_adı') çağırabilirsiniz."
+    };
+}
 
 // Helper to find connected browser with sticky session-to-device binding
 const sessionDeviceBindings = new Map(); // sessionId -> { boundDeviceId, lastToolCallTime }
@@ -592,7 +892,8 @@ app.post('/message', async (req, res) => {
             },
             serverInfo: {
                 name: "mcp-android-bridge",
-                version: "1.0.0"
+                version: "1.1.0",
+                description: "Android Real Browser MCP Bridge. To view full guide, parameters, and recommended agent workflows, call 'browser_get_tool_documentation'."
             }
         });
         return res.status(200).send("accepted");
@@ -619,6 +920,23 @@ app.post('/message', async (req, res) => {
         // Strip deviceId from args to avoid passing it to WebView
         const cleanArgs = { ...args };
         delete cleanArgs.deviceId;
+
+        // Direct handling for Documentation / Skill Guide Tool (Zero-latency server response)
+        if (toolName === "browser_get_tool_documentation" || toolName === "get_tool_documentation" || toolName === "browser_get_skills" || toolName === "get_skills") {
+            const toolDocResponse = generateDocumentationResponse(cleanArgs.tool_name || cleanArgs.name, cleanArgs.category);
+            const session = sseSessions.get(sessionId);
+            const clientName = (session && session.clientName) ? session.clientName : 'Yapay Zeka';
+            addLog(sessionId, clientName, 'MCP Sunucusu', `Dokümantasyon Çağrısı: ${toolName}`, 'success', `Hedef Araç: ${cleanArgs.tool_name || 'all'} (Kategori: ${cleanArgs.category || 'all'})`);
+            
+            const content = [
+                {
+                    type: "text",
+                    text: JSON.stringify(toolDocResponse, null, 2)
+                }
+            ];
+            reply({ content });
+            return res.status(200).send("accepted");
+        }
 
         let actionType = "";
         switch (toolName) {
@@ -1015,6 +1333,13 @@ fallbackRoutes.forEach(route => {
     app.all(route.path, (req, res) => {
         directToolHandler(route.type, req, res);
     });
+});
+
+// REST Documentation / Skills Endpoint
+app.all(['/mcp/tools/browser_get_tool_documentation', '/tools/browser_get_tool_documentation', '/api/docs', '/api/skills'], (req, res) => {
+    const args = req.method === 'POST' ? req.body : req.query;
+    const toolDocResponse = generateDocumentationResponse(args.tool_name || args.name, args.category);
+    return res.json(toolDocResponse);
 });
 
 // JSON API Status endpoint for Live updates
