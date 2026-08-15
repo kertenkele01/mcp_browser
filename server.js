@@ -1345,6 +1345,56 @@ app.get('/', (req, res) => {
     `);
 });
 
+// OAuth 2.0 & Claude Web Connector Auto-Registration Support
+app.get(['/.well-known/oauth-authorization-server', '/.well-known/openid-configuration', '/.well-known/mcp-configuration'], (req, res) => {
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+    const host = req.headers['host'] || 'mcp-browser-1.onrender.com';
+    const baseUrl = `${protocol}://${host}`;
+
+    res.json({
+        issuer: baseUrl,
+        authorization_endpoint: `${baseUrl}/oauth/authorize`,
+        token_endpoint: `${baseUrl}/oauth/token`,
+        registration_endpoint: `${baseUrl}/oauth/register`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code"],
+        code_challenge_methods_supported: ["S256", "plain"],
+        token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"]
+    });
+});
+
+app.post(['/oauth/register', '/register'], (req, res) => {
+    res.json({
+        client_id: "mcp_auto_client_id",
+        client_secret: "mcp_auto_client_secret",
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        client_secret_expires_at: 0,
+        redirect_uris: req.body?.redirect_uris || ["https://claude.ai/oauth/callback"]
+    });
+});
+
+app.get(['/oauth/authorize', '/authorize'], (req, res) => {
+    const redirectUri = req.query.redirect_uri || req.query.redirect_url || 'https://claude.ai/oauth/callback';
+    const state = req.query.state || '';
+    const code = 'mcp_auto_code_' + randomUUID().substring(0, 8);
+    
+    const targetUrl = new URL(redirectUri);
+    targetUrl.searchParams.set('code', code);
+    if (state) targetUrl.searchParams.set('state', state);
+
+    console.log(`[OAuth] Auto-approving OAuth authorize request for Claude Web -> Redirecting to ${targetUrl.toString()}`);
+    return res.redirect(targetUrl.toString());
+});
+
+app.post(['/oauth/token', '/token'], (req, res) => {
+    res.json({
+        access_token: "mcp_auto_access_token",
+        token_type: "Bearer",
+        expires_in: 31536000,
+        scope: "mcp"
+    });
+});
+
 // Start listening
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
