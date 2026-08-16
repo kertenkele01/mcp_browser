@@ -25,18 +25,23 @@ const wss = new WebSocketServer({ noServer: true });
 const browsers = new Map(); // deviceId -> WebSocket connection
 const pendingRequests = new Map(); // messageId -> { resolve, reject, timeout }
 
-// Logging system
+// Logging system with sanitization & security masking
 const logs = [];
 function addLog(sessionId, clientName, deviceId, action, status, details) {
+    let cleanDetails = typeof details === 'string' ? details : JSON.stringify(details || '');
+    // Mask base64 images and sensitive tokens/passwords in logs
+    cleanDetails = cleanDetails.replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g, '[IMAGE_DATA]');
+    cleanDetails = cleanDetails.replace(/(token|secret|password|apiKey|bearer)[:=]\s*["']?([a-zA-Z0-9_\-\.]{6,})["']?/gi, '$1: [PROTECTED]');
+
     const logEntry = {
         id: randomUUID().substring(0, 8),
         timestamp: new Date().toLocaleTimeString('tr-TR'),
-        sessionId: sessionId ? sessionId.substring(0, 8) : 'N/A',
+        sessionId: sessionId ? sessionId.substring(0, 16) : 'N/A',
         clientName: clientName || 'N/A',
         deviceId: deviceId || 'Varsayılan',
         action,
         status, // 'success', 'error', 'pending', 'info'
-        details: details || ''
+        details: cleanDetails || ''
     };
     logs.unshift(logEntry);
     if (logs.length > 100) {
@@ -244,16 +249,13 @@ const TOOLS = [
         }
     },
     {
-        name: "browser_switch_session",
-        description: "Belirtilen hedef AI veya kişisel oturuma geçiş yapar. Farklı bir AI oturumuna dönmek veya kişisel oturuma geçmek için kullanılır.",
+        name: "browser_list_sessions",
+        description: "Tüm aktif oturumları listeler. Eğer kullanıcı ayarlarında oturumlar arası erişim kapalı ise yalnızca mevcut AI oturumu döner.",
         inputSchema: {
             type: "object",
             properties: {
-                targetSessionId: { type: "string", description: "Geçilmek istenen oturum ID'si (örn. 'ai_session_cursor', 'personal_browser')" },
-                sessionToken: { type: "string", description: "Güvenlik token'ı (opsiyonel)" },
                 deviceId: { type: "string", description: "Hedef cihaz ID'si (opsiyonel)" }
-            },
-            required: ["targetSessionId"]
+            }
         }
     },
     {
@@ -302,7 +304,7 @@ const TOOL_DOCUMENTATION = {
         },
         tabs_and_sessions: {
             name: "Sekme & Profil/Oturum Yönetimi",
-            tools: ["browser_new_tab", "browser_close_tab", "browser_list_tabs", "browser_switch_tab", "browser_get_session_info", "browser_switch_session", "browser_clear_session_data"]
+            tools: ["browser_new_tab", "browser_close_tab", "browser_list_tabs", "browser_switch_tab", "browser_get_session_info", "browser_clear_session_data"]
         },
         meta: {
             name: "Rehber & Dokümantasyon",
@@ -461,16 +463,16 @@ const TOOL_DOCUMENTATION = {
         browser_get_session_info: {
             name: "browser_get_session_info",
             category: "tabs_and_sessions",
-            summary: "Mevcut oturumun ID'sini, güvenlik token'ını, çerez durumunu ve açık sekme sayısını döner.",
-            parameters: {}
+            summary: "Mevcut oturumun ID'sini, güvenlik token'ını, çerez durumunu, oturumlar arası erişim politikasını ve açık sekme sayısını döner.",
+            parameters: {},
+            best_practice: "Kendi AI istemci bilgilerinizi ve cihazdaki oturum erişim izin durumunu kontrol etmek için çağırın."
         },
-        browser_switch_session: {
-            name: "browser_switch_session",
+        browser_list_sessions: {
+            name: "browser_list_sessions",
             category: "tabs_and_sessions",
-            summary: "Farklı bir AI oturumuna veya 'personal_browser' oturumuna geçiş yapar.",
-            parameters: {
-                targetSessionId: "(Zorunlu, String) Hedef oturum ID'si."
-            }
+            summary: "Kullanılabilir oturumları listeler. Oturumlar arası geçiş izni kapalıysa yalnızca kendi oturumunuz döner.",
+            parameters: {},
+            best_practice: "Mevcut oturumları incelemek için kullanın. Eğer kullanıcı oturumlar arası geçişi kısıtlamışsa yalnızca kendi oturumunuz listelenir."
         },
         browser_clear_session_data: {
             name: "browser_clear_session_data",
@@ -957,6 +959,7 @@ app.post('/message', async (req, res) => {
             case "browser_list_tabs": actionType = "list_tabs"; break;
             case "browser_switch_tab": actionType = "switch_tab"; break;
             case "browser_get_session_info": actionType = "get_session_info"; break;
+            case "browser_list_sessions": actionType = "list_sessions"; break;
             case "browser_switch_session": actionType = "switch_session_mcp"; break;
             case "browser_clear_session_data": actionType = "clear_session_data"; break;
             default:
